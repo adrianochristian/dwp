@@ -61,9 +61,9 @@ O schema aplica, além das validações da aplicação:
 - Uma reversão processada por `(referenceTransactionId, kind)`.
 - Inbox única por consumidor/mensagem; outbox identificada pelo `eventId` persistido.
 - Saldos não negativos, valores financeiros exatos, aritmética dos lançamentos e relações por FK.
-- Proibição de `UPDATE` e `DELETE` no ledger e de alteração de transações terminais.
+- Proibição de `UPDATE`, `DELETE` e `TRUNCATE` no ledger e de alteração de transações terminais.
 
-Triggers diferidos conferem a correspondência entre transação processada e ledger, direção, valor, identidade da wallet e referência, continuidade entre versões e igualdade entre o último saldo do ledger e o saldo materializado. Essas verificações usam buscas indexadas pela transação ou pela versão anterior/mais recente da wallet. O processamento de cada aposta não soma o histórico inteiro.
+Triggers diferidos conferem a correspondência entre transação processada e ledger, direção, valor, identidade da wallet e referência, continuidade entre versões e igualdade entre o último saldo do ledger e o saldo materializado. Essas verificações usam buscas indexadas pela transação ou pela versão anterior/mais recente da wallet. O processamento de cada aposta não soma o histórico inteiro. Um trigger diferido adicional verifica o sucessor da abertura: ele impede inserir uma abertura retroativa na versão 1 depois de uma wallet zerada já ter recebido seu primeiro movimento na versão 2. Abertura e movimento seguinte na mesma transação SQL continuam permitidos quando os saldos são contíguos. O bloqueio de `TRUNCATE` também protege a exclusão em massa do ledger.
 
 A FK da transação exige que a wallet exista. A identidade completa de jogador/moeda é conferida para transações processadas, permitindo persistir tentativas rejeitadas por divergência de identidade. Uma wallet inexistente resulta em `404`, sem registro de aposta: não é possível criar esse registro respeitando a FK.
 
@@ -171,7 +171,7 @@ Autenticação só é desativada quando `AUTH_ENABLED=false` está explícito pa
 
 ## Evidências e limites
 
-As execuções de validação da entrega registraram 59 testes unitários, 107 testes de integração e 4 testes de autenticação. A suíte cobre parsing/limites, estados terminais, regras financeiras, SQL direto e migrations, 50 submissões paralelas da mesma aposta, duas apostas de `80.00` disputando `100.00`, wallets independentes e três processos reais.
+As execuções de validação da entrega registraram 59 testes unitários, 110 testes de integração e 4 testes de autenticação. A suíte cobre parsing/limites, estados terminais, regras financeiras, SQL direto e migrations, 50 submissões paralelas da mesma aposta, duas apostas de `80.00` disputando `100.00`, wallets independentes e três processos reais.
 
 Os cenários de falha incluem rollback antes do commit, redelivery após commit antes do ack, dois publishers, retomada de leases, indisponibilidade de PostgreSQL/SQS, referências fora de ordem, expiração e disputa de reprocessamento com HTTP. Os testes de crash usam processos separados e `SIGKILL` em pontos antes/depois do envio e depois do commit antes do ack. Os cenários financeiros conferem reconstrução do saldo pelo ledger, ausência de efeitos duplicados e não negatividade.
 

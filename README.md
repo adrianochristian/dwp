@@ -6,7 +6,7 @@ Valores monetários entram e saem como strings com duas casas decimais, por exem
 
 ## Executar em ambiente limpo
 
-Pré-requisitos: Linux, Bun **1.4.4**, Docker Engine com Docker Compose v2 e `curl`. Deixe livres as portas locais `5432` para PostgreSQL, `4566` para MiniStack/SQS e `3000` para a API. O perfil opcional de Keycloak usa `8080`.
+Pré-requisitos: Linux, Git, Bun **1.4.4**, Docker Engine com Docker Compose v2 e `curl`. Deixe livres as portas locais `5432` para PostgreSQL, `4566` para MiniStack/SQS e `3000` para a API. O perfil opcional de Keycloak usa `8080`.
 
 ```bash
 git clone https://github.com/adrianochristian/dwp.git
@@ -197,7 +197,7 @@ O publisher entrega em `wager-events` os envelopes `WagerTransactionProcessed`, 
 
 ## Testes
 
-As contagens da entrega são **59 testes de unidade/bootstrap**, **107 de integração** e **4 de autenticação**. Os testes de integração usam PostgreSQL e MiniStack reais, bancos e filas isolados, concorrência em três processos, `SIGKILL`, redelivery, publishers concorrentes e indisponibilidade de dependências. O papel de banco do Compose pode criar bancos temporários, como exigem esses testes.
+As contagens da entrega são **59 testes de unidade/bootstrap**, **110 de integração** e **4 de autenticação**. Os testes de integração usam PostgreSQL e MiniStack reais, bancos e filas isolados, concorrência em três processos, `SIGKILL`, redelivery, publishers concorrentes e indisponibilidade de dependências. O papel de banco do Compose pode criar bancos temporários, como exigem esses testes.
 
 ```bash
 bun run build
@@ -303,7 +303,7 @@ Execute a carga sem outras suítes ou cargas concorrentes para preservar a compa
 
 ## Migrations e encerramento
 
-`bun run migration:down` desfaz a última migration aplicada; `bun run migration:up` reaplica as pendentes. Faça reversões em bancos de desenvolvimento, pois elas removem os dados das estruturas revertidas.
+`bun run migration:down` desfaz a última migration aplicada; `bun run migration:up` reaplica as pendentes. Faça reversões em bancos de desenvolvimento: elas podem remover guardas de integridade, tabelas e seus dados.
 
 Encerre API e workers com `Ctrl+C`, depois:
 
