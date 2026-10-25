@@ -10,16 +10,17 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "bun dist/main.js",
-    "test": "bun run build && bun test",
+    "test": "bun run build && AUTH_ENABLED=false bun test",
     "typecheck": "bun run build && tsc --noEmit -p tsconfig.test.json",
     "infra:up": "docker compose up -d --wait",
     "infra:down": "docker compose down",
     "queues:init": "bun run build && bun dist/infrastructure/messaging/bootstrap-queues.js",
     "migration:up": "bun run build && bun dist/infrastructure/persistence/migrate.js up",
     "migration:down": "bun run build && bun dist/infrastructure/persistence/migrate.js down",
-    "test:integration": "bun run build && DWP_INTEGRATION=1 bun test test/infrastructure",
+    "test:integration": "bun run build && AUTH_ENABLED=false DWP_INTEGRATION=1 bun test test/infrastructure",
     "start:publisher": "WORKER_ROLE=publisher bun dist/worker.js",
-    "start:worker": "bun dist/worker.js"
+    "start:worker": "bun dist/worker.js",
+    "test:auth": "bun run build && DWP_AUTH_INTEGRATION=1 bun test test/infrastructure/auth.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "3.1156.0",
@@ -29,6 +30,7 @@
     "@nestjs/common": "12.2.0",
     "@nestjs/core": "12.2.0",
     "@nestjs/platform-express": "12.2.0",
+    "jose": "6.2.13",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2"
   },

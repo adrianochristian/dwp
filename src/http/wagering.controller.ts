@@ -12,12 +12,14 @@ import {
 } from '@nestjs/common';
 import { WageringService } from '../application/wagering-service.js';
 import { WageringQueries } from '../application/wagering-queries.js';
+import { Access } from '../auth/access.decorator.js';
 
 interface StatusResponse {
   status(code: number): unknown;
 }
 
 @Controller()
+@Access('operator')
 export class WageringController {
   constructor(
     @Inject(WageringService) private readonly service: WageringService,
@@ -47,16 +49,19 @@ export class WageringController {
   }
 
   @Get('wagering/transactions/:transactionId')
+  @Access('provider', 'transaction')
   getTransaction(@Param('transactionId') transactionId: string) {
     return this.queries.getTransaction(transactionId);
   }
 
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
+  @Access('provider', 'path')
   getExternalTransaction(@Param('providerId') providerId: string, @Param('externalTransactionId') externalTransactionId: string) {
     return this.queries.getExternalTransaction(providerId, externalTransactionId);
   }
 
   @Post('wagering/transactions')
+  @Access('provider', 'body')
   @HttpCode(200)
   async submit(
     @Body() body: unknown,

@@ -3,6 +3,7 @@ import type { MikroORM } from '@mikro-orm/postgresql';
 import { Controller, Get, Header, Inject, ServiceUnavailableException } from '@nestjs/common';
 import { getQueueUrl, queueNames } from '../infrastructure/messaging/sqs.js';
 import { metrics } from '../observability/metrics.js';
+import { Access } from '../auth/access.decorator.js';
 
 @Controller()
 export class OperationalController {
@@ -12,6 +13,7 @@ export class OperationalController {
   ) {}
 
   @Get('health/ready')
+  @Access('public')
   async ready(): Promise<{ status: 'ok' }> {
     const signal = AbortSignal.timeout(3_000);
     try {
@@ -32,6 +34,7 @@ export class OperationalController {
   }
 
   @Get('metrics')
+  @Access('operator')
   @Header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
   async metrics(): Promise<string> {
     const [row] = await this.database.em.fork().getConnection().execute<{ lag_seconds: string }[]>(`

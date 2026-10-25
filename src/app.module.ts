@@ -7,6 +7,10 @@ import { HealthController } from './health.controller.js';
 import { OperationalController } from './http/readiness.controller.js';
 import { createSqsClient } from './infrastructure/messaging/sqs.js';
 import { ObservedWageringQueries, ObservedWageringService } from './observability/observed-wagering.js';
+import { APP_GUARD } from '@nestjs/core';
+import { AccessGuard } from './auth/access.guard.js';
+import { createIdentityPort } from './auth/keycloak-identity.js';
+import { PROVIDER_IDENTITY_PORT } from './auth/provider-identity.js';
 
 @Module({ controllers: [HealthController] })
 export class AppModule {
@@ -20,6 +24,8 @@ export class AppModule {
         { provide: WageringQueries, useValue: new ObservedWageringQueries(database) },
         { provide: 'Database', useValue: database },
         { provide: 'SqsClient', useValue: sqs },
+        { provide: PROVIDER_IDENTITY_PORT, useValue: createIdentityPort() },
+        { provide: APP_GUARD, useClass: AccessGuard },
         { provide: 'DatabaseLifecycle', useValue: {
           onApplicationShutdown: async () => { sqs.destroy(); await database.close(true); },
         } },
