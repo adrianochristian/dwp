@@ -144,12 +144,12 @@ export class WageringService {
           } else if (!transaction.affectsBalance()) {
             transaction.markProcessed(reference?.id, at);
           } else {
-            if (transaction.kind === WagerTransactionKind.Refund && reference) {
+            if (transaction.requiresReference() && reference) {
               const existing = await em.execute<{ id: string }[]>(`select id from dwp.wager_transactions
                 where reference_transaction_id = ? and kind = ? and status = 'PROCESSED' limit 1`, [reference.id, transaction.kind]);
               if (existing.length > 0) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference was already reversed by this operation kind');
             }
-            movement = transaction.kind === WagerTransactionKind.Bet
+            movement = transaction.ledgerDirectionFor(reference) === LedgerDirection.Debit
               ? wallet.debit(transaction.money, at)
               : wallet.credit(transaction.money, at);
           }
@@ -159,7 +159,10 @@ export class WageringService {
             'REFERENCE_MISMATCH', 'REFERENCE_REJECTED', 'REFERENCE_FAILED', 'INVALID_REFERENCE_KIND',
             'REFERENCE_AMOUNT_MISMATCH', 'REVERSAL_ALREADY_PROCESSED',
           ].includes(error.code)) throw error;
-          transaction.reject(error.code);
+          const failureCode = transaction.kind === WagerTransactionKind.Rollback && error.code === 'INSUFFICIENT_FUNDS'
+            ? 'REVERSAL_INSUFFICIENT_FUNDS'
+            : error.code;
+          transaction.reject(failureCode);
         }
 
         const context = { correlationId: transaction.id, occurredAt: at };
