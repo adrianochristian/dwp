@@ -69,7 +69,8 @@ export interface WagerInput {
 export function wagerRequest(value: unknown): WagerInput {
   const props = object(value);
   const kind = text(props.kind, 'kind');
-  if (kind !== WagerTransactionKind.Bet && kind !== WagerTransactionKind.Win && kind !== WagerTransactionKind.Loss) {
+  if (kind !== WagerTransactionKind.Bet && kind !== WagerTransactionKind.Win
+    && kind !== WagerTransactionKind.Loss && kind !== WagerTransactionKind.Refund) {
     invalidRequest('The transaction kind cannot be submitted', 'INVALID_TRANSACTION_KIND');
   }
   if (kind === WagerTransactionKind.Bet && props.referenceExternalTransactionId !== undefined) {
@@ -94,6 +95,9 @@ export function wagerRequest(value: unknown): WagerInput {
   }
   if (input.referenceExternalTransactionId === input.externalTransactionId) {
     invalidRequest('A transaction cannot reference itself', 'INVALID_REFERENCE');
+  }
+  if (input.kind === WagerTransactionKind.Refund && input.referenceExternalTransactionId === undefined) {
+    invalidRequest('REFUND requires referenceExternalTransactionId', 'REFERENCE_REQUIRED');
   }
   return input;
 }
