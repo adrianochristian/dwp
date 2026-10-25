@@ -11,6 +11,7 @@ import {
   Res,
 } from '@nestjs/common';
 import { WageringService } from '../application/wagering-service.js';
+import { WageringQueries } from '../application/wagering-queries.js';
 
 interface StatusResponse {
   status(code: number): unknown;
@@ -18,7 +19,10 @@ interface StatusResponse {
 
 @Controller()
 export class WageringController {
-  constructor(@Inject(WageringService) private readonly service: WageringService) {}
+  constructor(
+    @Inject(WageringService) private readonly service: WageringService,
+    @Inject(WageringQueries) private readonly queries: WageringQueries,
+  ) {}
 
   @Post('wallets')
   @HttpCode(201)
@@ -29,6 +33,21 @@ export class WageringController {
   @Get('wallets/:walletId')
   getWallet(@Param('walletId') walletId: string) {
     return this.service.getWallet(walletId);
+  }
+
+  @Get('wallets/:walletId/ledger')
+  ledger(@Param('walletId') walletId: string, @Query('cursor') cursor: unknown, @Query('limit') limit: unknown) {
+    return this.queries.ledger(walletId, cursor, limit);
+  }
+
+  @Get('wagering/transactions/:transactionId')
+  getTransaction(@Param('transactionId') transactionId: string) {
+    return this.queries.getTransaction(transactionId);
+  }
+
+  @Get('providers/:providerId/wagering/transactions/:externalTransactionId')
+  getExternalTransaction(@Param('providerId') providerId: string, @Param('externalTransactionId') externalTransactionId: string) {
+    return this.queries.getExternalTransaction(providerId, externalTransactionId);
   }
 
   @Post('wagering/transactions')
