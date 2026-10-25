@@ -69,7 +69,7 @@ export interface WagerInput {
 export function wagerRequest(value: unknown): WagerInput {
   const props = object(value);
   const kind = text(props.kind, 'kind');
-  if (kind !== WagerTransactionKind.Bet && kind !== WagerTransactionKind.Win) {
+  if (kind !== WagerTransactionKind.Bet && kind !== WagerTransactionKind.Win && kind !== WagerTransactionKind.Loss) {
     invalidRequest('The transaction kind cannot be submitted', 'INVALID_TRANSACTION_KIND');
   }
   if (kind === WagerTransactionKind.Bet && props.referenceExternalTransactionId !== undefined) {
@@ -89,7 +89,9 @@ export function wagerRequest(value: unknown): WagerInput {
     }),
   };
   if (input.providerId === '__internal__') invalidRequest('The internal provider identity is reserved', 'INVALID_PROVIDER');
-  if (!input.money.isPositive()) invalidRequest('The transaction requires a positive amount', 'INVALID_TRANSACTION_AMOUNT');
+  if (input.kind !== WagerTransactionKind.Loss && !input.money.isPositive()) {
+    invalidRequest('The transaction requires a positive amount', 'INVALID_TRANSACTION_AMOUNT');
+  }
   if (input.referenceExternalTransactionId === input.externalTransactionId) {
     invalidRequest('A transaction cannot reference itself', 'INVALID_REFERENCE');
   }

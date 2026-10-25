@@ -141,6 +141,8 @@ export class WageringService {
           }
           if (referencePending) {
             transaction.markPendingReference();
+          } else if (!transaction.affectsBalance()) {
+            transaction.markProcessed(reference?.id, at);
           } else {
             movement = transaction.kind === WagerTransactionKind.Bet
               ? wallet.debit(transaction.money, at)
@@ -173,6 +175,8 @@ export class WageringService {
           if (row.status !== WagerTransactionStatus.PendingReference) {
             await this.enqueue(em, WagerTransactionPendingReference.from(transaction, context));
           }
+        } else if (transaction.status === WagerTransactionStatus.Processed) {
+          await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
         } else {
           await this.enqueue(em, WagerTransactionRejected.from(transaction, context));
         }
