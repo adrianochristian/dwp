@@ -31,4 +31,29 @@ export class WageringController {
     return this.service.getWallet(walletId);
   }
 
+  @Post('wagering/transactions')
+  @HttpCode(200)
+  async submit(
+    @Body() body: unknown,
+    @Headers('idempotency-key') idempotencyKey: unknown,
+    @Res({ passthrough: true }) response: StatusResponse,
+  ) {
+    const result = await this.service.submit(body, idempotencyKey);
+    switch (result.status) {
+      case 'PROCESSED':
+        response.status(200);
+        break;
+      case 'PENDING':
+      case 'PENDING_REFERENCE':
+        response.status(202);
+        break;
+      case 'REJECTED':
+        response.status(422);
+        break;
+      default:
+        response.status(503);
+    }
+    return result;
+  }
+
 }
