@@ -1,5 +1,6 @@
 import { DomainError } from './domain-error.js';
 import { Money } from './money.js';
+import { MAX_WALLET_VERSION } from './wallet-version.js';
 
 export interface WalletState {
   id: string;
@@ -77,7 +78,8 @@ export class Wallet {
     if (!money.isPositive()) {
       throw new DomainError('NON_POSITIVE_AMOUNT', 'A balance movement requires a positive amount');
     }
-    if (!Number.isSafeInteger(this._version + 1)) {
+    const nextVersion = this._version + 1;
+    if (!Number.isSafeInteger(nextVersion) || nextVersion > MAX_WALLET_VERSION) {
       throw new DomainError('WALLET_VERSION_OVERFLOW', 'The wallet version exceeds the supported range');
     }
   }

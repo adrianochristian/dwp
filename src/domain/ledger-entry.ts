@@ -1,5 +1,6 @@
 import { DomainError } from './domain-error.js';
 import type { Money } from './money.js';
+import { MAX_WALLET_VERSION } from './wallet-version.js';
 
 export enum LedgerDirection {
   Debit = 'DEBIT',
@@ -43,7 +44,7 @@ export class WalletLedgerEntry {
     if (props.balanceBefore.isNegative() || props.balanceAfter.isNegative()) {
       throw new DomainError('NEGATIVE_BALANCE', 'Ledger balances cannot be negative');
     }
-    if (!Number.isSafeInteger(props.walletVersion) || props.walletVersion < 1) {
+    if (!Number.isSafeInteger(props.walletVersion) || props.walletVersion < 1 || props.walletVersion > MAX_WALLET_VERSION) {
       throw new DomainError('INVALID_WALLET_VERSION', 'A ledger entry requires a positive wallet version');
     }
     if (!Object.values(LedgerDirection).includes(props.direction)) {

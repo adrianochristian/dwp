@@ -1,0 +1,1 @@
+export const MAX_WALLET_VERSION = 2147483647;
