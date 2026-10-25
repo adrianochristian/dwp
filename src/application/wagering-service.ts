@@ -2,7 +2,7 @@ import { HttpException } from '@nestjs/common';
 import { ForeignKeyConstraintViolationException, UniqueConstraintViolationException } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 import { createHash } from 'node:crypto';
-import { WalletBalanceChanged, WagerTransactionProcessed, WagerTransactionRejected, type IntegrationEvent } from '../domain/integration-event.js';
+import { WalletBalanceChanged, WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, type IntegrationEvent } from '../domain/integration-event.js';
 import { DomainError } from '../domain/domain-error.js';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/ledger-entry.js';
 import { Money, type MoneyProps } from '../domain/money.js';
@@ -26,10 +26,25 @@ export interface SubmissionResult {
 
 interface TransactionRow {
   id: string;
+  provider_id: string;
+  external_transaction_id: string;
+  idempotency_key: string;
   payload_hash: string;
+  wallet_id: string;
+  player_id: string;
+  round_id: string;
+  game_id: string;
+  kind: WagerTransactionKind;
+  amount_cents: string;
+  currency: string;
+  reference_external_transaction_id: string | null;
+  reference_transaction_id: string | null;
   status: WagerTransactionStatus;
+  failure_code: string | null;
   result: SubmissionResult | null;
+  retry_count: number;
   created_at: string;
+  processed_at: string | null;
 }
 
 export class WageringService {
@@ -69,26 +84,32 @@ export class WageringService {
     const key = text(idempotencyKey, 'Idempotency-Key', 500);
     const payloadHash = canonicalHash(wagerPayload(input));
     const requestedId = crypto.randomUUID();
+    const proposed = WagerTransaction.create({ ...input, id: requestedId, idempotencyKey: key, payloadHash });
     try {
       return await this.orm.em.fork().transactional(async em => {
         await em.execute(`insert into dwp.wager_transactions
           (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
-           wallet_id, player_id, round_id, game_id, kind, amount_cents, currency, status)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') on conflict do nothing`, [
+           wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
+           reference_external_transaction_id, status, created_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?) on conflict do nothing`, [
           requestedId, input.providerId, input.externalTransactionId, key, payloadHash,
           input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
-          input.money.cents.toString(), input.money.currency,
+          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null, proposed.createdAt,
         ]);
         // A duplicate blocks on the unique index before acquiring the same row lock.
         // Every entry point takes this transaction lock before the wallet lock.
         const row = (await em.execute<TransactionRow[]>(
-          'select id, payload_hash, status, result, created_at from dwp.wager_transactions where idempotency_key = ? for update', [key],
+          'select * from dwp.wager_transactions where idempotency_key = ? for update', [key],
         ))[0];
         if (!row) throw new HttpException({ code: 'EXTERNAL_IDENTITY_CONFLICT', message: 'This provider transaction already uses another idempotency key' }, 409);
         if (row.payload_hash !== payloadHash) {
           throw new HttpException({ code: 'IDEMPOTENCY_CONFLICT', message: 'This idempotency key was used for a different business payload' }, 409);
         }
-        if (row.result) return { ...row.result, idempotentReplay: true };
+        const transaction = this.transactionFromRow(row);
+        if (transaction.isTerminal()) {
+          if (!row.result) throw new Error('A terminal transaction must have a persisted response');
+          return { ...row.result, idempotentReplay: true };
+        }
 
         // Foreign-key inserts hold KEY SHARE. NO KEY UPDATE serializes balance
         // writes while remaining compatible with those locks on other requests.
@@ -96,34 +117,62 @@ export class WageringService {
         const record = await em.findOne(WalletRecord, { id: input.walletId });
         if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
         const wallet = this.walletFromRecord(record);
-        const transaction = WagerTransaction.create({ ...input, id: row.id, idempotencyKey: key, payloadHash, createdAt: new Date(row.created_at) });
         const at = new Date();
         let movement: WalletMovement | undefined;
+        let reference: WagerTransaction | undefined;
+        let referencePending = false;
         try {
           if (wallet.playerId !== transaction.playerId) throw new DomainError('WALLET_PLAYER_MISMATCH', 'The wallet belongs to a different player');
-          movement = wallet.debit(transaction.money, at);
+          if (wallet.currency !== transaction.money.currency) throw new DomainError('CURRENCY_MISMATCH', 'The operation currency must match the wallet currency');
+          if (transaction.referenceExternalTransactionId !== undefined) {
+            const referenceRow = (await em.execute<TransactionRow[]>(`select * from dwp.wager_transactions
+              where provider_id = ? and external_transaction_id = ?`, [transaction.providerId, transaction.referenceExternalTransactionId]))[0];
+            if (referenceRow) {
+              reference = this.transactionFromRow(referenceRow);
+              try {
+                transaction.validateReference(reference);
+              } catch (error) {
+                if (!(error instanceof DomainError) || error.code !== 'REFERENCE_PENDING') throw error;
+                referencePending = true;
+              }
+            } else {
+              referencePending = true;
+            }
+          }
+          if (referencePending) {
+            transaction.markPendingReference();
+          } else {
+            movement = transaction.kind === WagerTransactionKind.Bet
+              ? wallet.debit(transaction.money, at)
+              : wallet.credit(transaction.money, at);
+          }
         } catch (error) {
           if (!(error instanceof DomainError) || ![
             'WALLET_PLAYER_MISMATCH', 'CURRENCY_MISMATCH', 'INSUFFICIENT_FUNDS', 'MONEY_OVERFLOW', 'WALLET_VERSION_OVERFLOW',
+            'REFERENCE_MISMATCH', 'REFERENCE_REJECTED', 'REFERENCE_FAILED', 'INVALID_REFERENCE_KIND',
           ].includes(error.code)) throw error;
           transaction.reject(error.code);
         }
 
         const context = { correlationId: transaction.id, occurredAt: at };
         if (movement) {
-          transaction.markProcessed(undefined, at);
+          transaction.markProcessed(reference?.id, at);
           record.balanceCents = wallet.balance.cents;
           record.version = wallet.version;
           record.updatedAt = wallet.updatedAt;
           await em.flush();
           const entry = WalletLedgerEntry.create({
             id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
-            direction: LedgerDirection.Debit, money: transaction.money,
+            direction: transaction.ledgerDirectionFor(reference), money: transaction.money,
             ...movement, createdAt: at,
           });
           await this.insertLedger(em, entry);
           await this.enqueue(em, WalletBalanceChanged.from(wallet, entry, context));
           await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
+        } else if (referencePending) {
+          if (row.status !== WagerTransactionStatus.PendingReference) {
+            await this.enqueue(em, WagerTransactionPendingReference.from(transaction, context));
+          }
         } else {
           await this.enqueue(em, WagerTransactionRejected.from(transaction, context));
         }
@@ -132,9 +181,12 @@ export class WageringService {
           balance: wallet.balance.toJSON(), idempotentReplay: false,
           ...(transaction.failureCode === undefined ? {} : { failureCode: transaction.failureCode }),
         };
+        const retries = row.retry_count + (referencePending ? 1 : 0);
+        const nextAttempt = new Date(at.getTime() + Math.min(60, 2 ** Math.min(row.retry_count, 6)) * 1_000);
         await em.execute(`update dwp.wager_transactions set status = ?, failure_code = ?,
-          result = ?::jsonb, processed_at = ? where id = ?`, [
-          transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null, transaction.id,
+          result = ?::jsonb, processed_at = ?, reference_transaction_id = ?, retry_count = ?, next_attempt_at = ? where id = ?`, [
+          transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null,
+          transaction.referenceTransactionId ?? null, retries, nextAttempt, transaction.id,
         ]);
         await this.options.beforeCommit?.();
         return result;
@@ -145,6 +197,19 @@ export class WageringService {
       }
       throw error;
     }
+  }
+
+  private transactionFromRow(row: TransactionRow): WagerTransaction {
+    return WagerTransaction.rehydrate({
+      id: row.id, providerId: row.provider_id, externalTransactionId: row.external_transaction_id,
+      idempotencyKey: row.idempotency_key, payloadHash: row.payload_hash,
+      walletId: row.wallet_id, playerId: row.player_id, roundId: row.round_id, gameId: row.game_id,
+      kind: row.kind, money: Money.fromMinorUnits(BigInt(row.amount_cents), row.currency),
+      referenceExternalTransactionId: row.reference_external_transaction_id ?? undefined,
+      referenceTransactionId: row.reference_transaction_id ?? undefined,
+      status: row.status, failureCode: row.failure_code ?? undefined,
+      createdAt: new Date(row.created_at), processedAt: row.processed_at ? new Date(row.processed_at) : undefined,
+    });
   }
 
   private walletFromRecord(record: WalletRecord): Wallet {
