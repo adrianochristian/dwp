@@ -4,17 +4,25 @@ import { WageringService } from './application/wagering-service.js';
 import { WageringQueries } from './application/wagering-queries.js';
 import { WageringController } from './http/wagering.controller.js';
 import { HealthController } from './health.controller.js';
+import { OperationalController } from './http/readiness.controller.js';
+import { createSqsClient } from './infrastructure/messaging/sqs.js';
+import { ObservedWageringQueries, ObservedWageringService } from './observability/observed-wagering.js';
 
 @Module({ controllers: [HealthController] })
 export class AppModule {
   static withDatabase(database: MikroORM): DynamicModule {
+    const sqs = createSqsClient();
     return {
       module: AppModule,
-      controllers: [WageringController],
+      controllers: [WageringController, OperationalController],
       providers: [
-        { provide: WageringService, useValue: new WageringService(database) },
-        { provide: WageringQueries, useValue: new WageringQueries(database) },
-        { provide: 'DatabaseLifecycle', useValue: { onApplicationShutdown: () => database.close(true) } },
+        { provide: WageringService, useValue: new ObservedWageringService(database, 'http') },
+        { provide: WageringQueries, useValue: new ObservedWageringQueries(database) },
+        { provide: 'Database', useValue: database },
+        { provide: 'SqsClient', useValue: sqs },
+        { provide: 'DatabaseLifecycle', useValue: {
+          onApplicationShutdown: async () => { sqs.destroy(); await database.close(true); },
+        } },
       ],
     };
   }

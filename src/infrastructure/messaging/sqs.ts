@@ -19,8 +19,8 @@ export function createSqsClient(): SQSClient {
   });
 }
 
-export async function getQueueUrl(client: SQSClient, name: string): Promise<string> {
-  const result = await client.send(new GetQueueUrlCommand({ QueueName: name }));
+export async function getQueueUrl(client: SQSClient, name: string, abortSignal?: AbortSignal): Promise<string> {
+  const result = await client.send(new GetQueueUrlCommand({ QueueName: name }), abortSignal ? { abortSignal } : {});
   if (!result.QueueUrl) throw new Error(`Missing URL for queue ${name}`);
   return result.QueueUrl;
 }
