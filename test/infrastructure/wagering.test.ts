@@ -5,6 +5,7 @@ import { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { Migration20261025000100 } from '../../dist/infrastructure/persistence/migrations/Migration20261025000100.js';
 import { Migration20261025000200 } from '../../dist/infrastructure/persistence/migrations/WageringSchema.js';
+import { Migration20261025000300 } from '../../dist/infrastructure/persistence/migrations/Migration20261025000300.js';
 import { WalletRecordSchema } from '../../dist/infrastructure/persistence/records.js';
 import { createApplication } from '../../dist/application.js';
 import type { INestApplication } from '@nestjs/common';
@@ -27,7 +28,7 @@ integration('wallet application transactions', () => {
     orm = await MikroORM.init({
       clientUrl: url.toString(), entities: [WalletRecordSchema], extensions: [Migrator],
       migrations: {
-        migrationsList: [Migration20261025000100, Migration20261025000200],
+        migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300],
         snapshot: false, snapshotOnMigrate: false,
       },
     });
