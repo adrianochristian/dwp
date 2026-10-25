@@ -161,6 +161,43 @@ export class WageringQueries {
     return { walletId, entries, nextCursor };
   }
 
+  async reconcile(id: string) {
+    const walletId = uuid(id, 'walletId');
+    // PostgreSQL gives the entire statement one snapshot, including both the
+    // materialized balance and the aggregate over immutable ledger entries.
+    const rows = await this.orm.em.fork().execute<{
+      currency: string;
+      stored_balance_cents: string;
+      calculated_balance_cents: string;
+      checked_entries: number;
+    }[]>(`
+      select w.currency, w.balance_cents::text as stored_balance_cents,
+        coalesce(sum(case when l.direction = 'CREDIT'
+          then l.amount_cents::numeric else -l.amount_cents::numeric end), 0)::text as calculated_balance_cents,
+        count(l.id)::integer as checked_entries
+      from dwp.wallets w left join dwp.wallet_ledger_entries l on l.wallet_id = w.id
+      where w.id = ? group by w.id`, [walletId]);
+    const row = rows[0];
+    if (!row) {
+      throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+    }
+    const stored = Money.fromMinorUnits(BigInt(row.stored_balance_cents), row.currency);
+    const calculated = Money.fromMinorUnits(BigInt(row.calculated_balance_cents), row.currency);
+    const difference = stored.subtract(calculated);
+    const consistent = difference.isZero();
+    if (!consistent) {
+      console.error(JSON.stringify({ event: 'wallet_reconciliation_inconsistent', walletId }));
+    }
+    return {
+      walletId,
+      storedBalance: stored.toJSON(),
+      calculatedBalance: calculated.toJSON(),
+      difference: difference.toJSON(),
+      consistent,
+      checkedEntries: row.checked_entries,
+    };
+  }
+
   private transactionResponse(row: TransactionRow | undefined) {
     if (!row) {
       throw new HttpException({ code: 'TRANSACTION_NOT_FOUND', message: 'The transaction does not exist' }, 404);

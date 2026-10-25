@@ -40,6 +40,12 @@ export class WageringController {
     return this.queries.ledger(walletId, cursor, limit);
   }
 
+  @Post('wallets/:walletId/reconciliation')
+  @HttpCode(200)
+  reconcile(@Param('walletId') walletId: string) {
+    return this.queries.reconcile(walletId);
+  }
+
   @Get('wagering/transactions/:transactionId')
   getTransaction(@Param('transactionId') transactionId: string) {
     return this.queries.getTransaction(transactionId);
