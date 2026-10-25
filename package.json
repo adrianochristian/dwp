@@ -20,7 +20,8 @@
     "test:integration": "bun run build && AUTH_ENABLED=false DWP_INTEGRATION=1 bun test test/infrastructure",
     "start:publisher": "WORKER_ROLE=publisher bun dist/worker.js",
     "start:worker": "bun dist/worker.js",
-    "test:auth": "bun run build && DWP_AUTH_INTEGRATION=1 bun test test/infrastructure/auth.test.ts"
+    "test:auth": "bun run build && DWP_AUTH_INTEGRATION=1 bun test test/infrastructure/auth.test.ts",
+    "test:load": "bun run build && bun scripts/load.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "3.1156.0",
