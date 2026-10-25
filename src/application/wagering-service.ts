@@ -2,7 +2,7 @@ import { HttpException } from '@nestjs/common';
 import { ForeignKeyConstraintViolationException, UniqueConstraintViolationException } from '@mikro-orm/core';
 import type { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 import { createHash } from 'node:crypto';
-import { WalletBalanceChanged, WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, type IntegrationEvent } from '../domain/integration-event.js';
+import { WalletBalanceChanged, WagerTransactionFailed, WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, type IntegrationEvent } from '../domain/integration-event.js';
 import { DomainError } from '../domain/domain-error.js';
 import { InboxMessage } from '../domain/inbox-message.js';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/ledger-entry.js';
@@ -10,7 +10,7 @@ import { Money, type MoneyProps } from '../domain/money.js';
 import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction.js';
 import { Wallet, type WalletMovement } from '../domain/wallet.js';
 import { WalletRecord } from '../infrastructure/persistence/records.js';
-import { canonicalHash, text, uuid, wagerPayload, wagerRequest, walletRequest } from './contracts.js';
+import { canonicalHash, invalidRequest, text, uuid, wagerPayload, wagerRequest, walletRequest } from './contracts.js';
 
 export interface WageringServiceOptions {
   /** Runs inside the transaction, before commit; useful for fault injection. */
@@ -226,6 +226,69 @@ export class WageringService {
           transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null,
           transaction.referenceTransactionId ?? null, retries, nextAttempt, transaction.id,
         ]);
+        return this.completeSubmission(em, inbox?.message, result);
+      });
+    } catch (error) {
+      if (error instanceof ForeignKeyConstraintViolationException) {
+        throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+      }
+      throw error;
+    }
+  }
+
+  async failSubmission(body: unknown, idempotencyKey: unknown, failureCode: string, inboxContext?: InboxContext): Promise<SubmissionResult> {
+    const input = wagerRequest(body);
+    const key = text(idempotencyKey, 'Idempotency-Key', 500);
+    const code = text(failureCode, 'failureCode', 100);
+    if (!/^[A-Z][A-Z0-9_]{0,99}$/.test(code)) invalidRequest('failureCode must be an uppercase stable identifier');
+    const payloadHash = canonicalHash(wagerPayload(input));
+    const proposed = WagerTransaction.create({ ...input, id: crypto.randomUUID(), idempotencyKey: key, payloadHash });
+    const inboxIdentity = inboxContext === undefined ? undefined : {
+      consumerName: text(inboxContext.consumerName, 'consumerName'),
+      messageId: text(inboxContext.messageId, 'messageId'),
+      payloadHash: canonicalHash({ idempotencyKey: key, ...wagerPayload(input) }),
+    };
+    try {
+      return await this.orm.em.fork().transactional(async em => {
+        const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(em, inboxIdentity);
+        if (inbox?.message.isProcessed()) {
+          if (!inbox.result) throw new Error('A processed inbox message must have a persisted response');
+          return this.completeSubmission(em, inbox.message, { ...inbox.result, idempotentReplay: true });
+        }
+        await em.execute(`insert into dwp.wager_transactions
+          (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+           wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
+           reference_external_transaction_id, status, created_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?) on conflict do nothing`, [
+          proposed.id, input.providerId, input.externalTransactionId, key, payloadHash,
+          input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
+          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null, proposed.createdAt,
+        ]);
+        const row = (await em.execute<TransactionRow[]>(
+          'select * from dwp.wager_transactions where idempotency_key = ? for update', [key],
+        ))[0];
+        if (!row) throw new HttpException({ code: 'EXTERNAL_IDENTITY_CONFLICT', message: 'This provider transaction already uses another idempotency key' }, 409);
+        if (row.payload_hash !== payloadHash) {
+          throw new HttpException({ code: 'IDEMPOTENCY_CONFLICT', message: 'This idempotency key was used for a different business payload' }, 409);
+        }
+        const transaction = this.transactionFromRow(row);
+        if (transaction.isTerminal()) {
+          if (!row.result) throw new Error('A terminal transaction must have a persisted response');
+          return this.completeSubmission(em, inbox?.message, { ...row.result, idempotentReplay: true });
+        }
+        await em.execute('select id from dwp.wallets where id = ? for no key update', [transaction.walletId]);
+        const record = await em.findOne(WalletRecord, { id: transaction.walletId });
+        if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+        const wallet = this.walletFromRecord(record);
+        transaction.fail(code);
+        const result: SubmissionResult = {
+          transactionId: transaction.id, status: transaction.status,
+          balance: wallet.balance.toJSON(), failureCode: code, idempotentReplay: false,
+        };
+        await em.execute(`update dwp.wager_transactions set status = ?, failure_code = ?, result = ?::jsonb where id = ?`, [
+          transaction.status, code, JSON.stringify(result), transaction.id,
+        ]);
+        await this.enqueue(em, WagerTransactionFailed.from(transaction, { correlationId: transaction.id }));
         return this.completeSubmission(em, inbox?.message, result);
       });
     } catch (error) {

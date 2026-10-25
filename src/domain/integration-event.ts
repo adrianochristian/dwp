@@ -149,6 +149,20 @@ export class WagerTransactionRejected extends IntegrationEvent<WagerTransactionE
   }
 }
 
+export class WagerTransactionFailed extends IntegrationEvent<WagerTransactionEventData> {
+  readonly eventType = 'WagerTransactionFailed';
+  readonly version = 1;
+
+  private constructor(value: IntegrationEventProps<WagerTransactionEventData>) {
+    super(value);
+    Object.freeze(this);
+  }
+
+  static from(transaction: WagerTransaction, ctx: EventContext): WagerTransactionFailed {
+    return new WagerTransactionFailed(props(transactionData(transaction), ctx, transaction.id));
+  }
+}
+
 export class WagerTransactionPendingReference extends IntegrationEvent<WagerTransactionEventData> {
   readonly eventType = 'WagerTransactionPendingReference';
   readonly version = 1;

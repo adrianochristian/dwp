@@ -1,31 +1,54 @@
 import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher.js';
 import { createSqsClient, getQueueUrl, queueNames } from './infrastructure/messaging/sqs.js';
 import { createDatabase } from './infrastructure/persistence/database.js';
+import { SqsConsumer } from './infrastructure/messaging/sqs-consumer.js';
+import { WageringService } from './application/wagering-service.js';
 
 export async function runWorker(): Promise<void> {
-  const role = process.env.WORKER_ROLE ?? 'publisher';
-  if (role !== 'publisher') throw new Error('WORKER_ROLE must be publisher');
+  const role = process.env.WORKER_ROLE ?? 'all';
+  if (!['publisher', 'consumer', 'all'].includes(role)) throw new Error('Invalid WORKER_ROLE');
   const database = await createDatabase();
   const sqs = createSqsClient();
   let publisher: OutboxPublisher | undefined;
+  let consumer: SqsConsumer | undefined;
   let stopping = false;
-  const requestStop = () => { stopping = true; };
+  let resolveStop: () => void;
+  const stopped = new Promise<void>(resolve => { resolveStop = resolve; });
+  const requestStop = () => { stopping = true; resolveStop(); };
   process.on('SIGINT', requestStop);
   process.on('SIGTERM', requestStop);
   try {
-    publisher = new OutboxPublisher(database, sqs, await getQueueUrl(sqs, queueNames.events));
-    console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid }));
-    while (!stopping) {
-      try {
-        await publisher.runOnce();
-      } catch {
-        console.error(JSON.stringify({ event: 'publisher_cycle_failed', code: 'INFRASTRUCTURE_UNAVAILABLE' }));
-      }
-      if (!stopping) await Bun.sleep(250);
+    const loops: Promise<unknown>[] = [];
+    if (role !== 'consumer') {
+      publisher = new OutboxPublisher(database, sqs,
+        process.env.EVENT_QUEUE_URL ?? await getQueueUrl(sqs, queueNames.events));
+      const current = publisher;
+      loops.push((async () => {
+        while (!stopping) {
+          try { await current.runOnce(); } catch {
+            console.error(JSON.stringify({ event: 'publisher_cycle_failed', code: 'INFRASTRUCTURE_UNAVAILABLE' }));
+          }
+          if (!stopping) await Bun.sleep(250);
+        }
+      })());
     }
+    if (role !== 'publisher') {
+      const [commands, deadLetters] = await Promise.all([
+        process.env.COMMAND_QUEUE_URL ?? getQueueUrl(sqs, queueNames.commands),
+        process.env.DLQ_QUEUE_URL ?? getQueueUrl(sqs, queueNames.deadLetters),
+      ]);
+      consumer = new SqsConsumer(new WageringService(database), sqs, commands, deadLetters, {
+        onError: () => console.error(JSON.stringify({ event: 'consumer_cycle_failed', code: 'INFRASTRUCTURE_UNAVAILABLE' })),
+      });
+      loops.push(consumer.run());
+    }
+    console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid }));
+    await Promise.race([Promise.all(loops), stopped]);
   } finally {
+    stopping = true;
     process.off('SIGINT', requestStop);
     process.off('SIGTERM', requestStop);
+    await consumer?.stop(10_000);
     await publisher?.stop();
     sqs.destroy();
     await database.close(true);

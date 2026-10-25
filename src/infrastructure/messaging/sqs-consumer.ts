@@ -16,6 +16,7 @@ export interface WagerCommandContext {
 export interface WagerCommandResult {
   status: string;
   transactionId?: string;
+  failureCode?: string;
 }
 
 export interface WagerCommandHandler {
@@ -227,6 +228,16 @@ export class SqsConsumer {
       await this.options.afterCommitBeforeAck?.(result, envelope);
       if (entry.released) return;
       await this.stopHeartbeat(entry);
+      if (result.status === 'FAILED') {
+        const code = result.failureCode ?? 'PROCESSING_FAILED';
+        await this.deadLetter(entry, code);
+        this.observe(this.options.onDeadLetter, {
+          consumerName: this.consumerName, messageId: envelope.messageId,
+          status: result.status, failureCode: code,
+          ...(result.transactionId === undefined ? {} : { transactionId: result.transactionId }),
+        });
+        return;
+      }
       await this.ack(entry);
       this.observe(this.options.onProcessed, {
         consumerName: this.consumerName, messageId: envelope.messageId, status: result.status,
