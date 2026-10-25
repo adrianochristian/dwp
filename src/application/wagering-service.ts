@@ -4,6 +4,7 @@ import type { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 import { createHash } from 'node:crypto';
 import { WalletBalanceChanged, WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, type IntegrationEvent } from '../domain/integration-event.js';
 import { DomainError } from '../domain/domain-error.js';
+import { InboxMessage } from '../domain/inbox-message.js';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/ledger-entry.js';
 import { Money, type MoneyProps } from '../domain/money.js';
 import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction.js';
@@ -22,6 +23,20 @@ export interface SubmissionResult {
   balance: MoneyProps;
   idempotentReplay: boolean;
   failureCode?: string;
+}
+
+export interface InboxContext {
+  consumerName: string;
+  messageId: string;
+}
+
+interface InboxRow {
+  consumer_name: string;
+  message_id: string;
+  payload_hash: string;
+  received_at: string;
+  processed_at: string | null;
+  result: SubmissionResult | null;
 }
 
 interface TransactionRow {
@@ -79,14 +94,24 @@ export class WageringService {
     return this.walletResponse(this.walletFromRecord(record));
   }
 
-  async submit(body: unknown, idempotencyKey: unknown): Promise<SubmissionResult> {
+  async submit(body: unknown, idempotencyKey: unknown, inboxContext?: InboxContext): Promise<SubmissionResult> {
     const input = wagerRequest(body);
     const key = text(idempotencyKey, 'Idempotency-Key', 500);
     const payloadHash = canonicalHash(wagerPayload(input));
+    const inboxIdentity = inboxContext === undefined ? undefined : {
+      consumerName: text(inboxContext.consumerName, 'consumerName'),
+      messageId: text(inboxContext.messageId, 'messageId'),
+      payloadHash: canonicalHash({ idempotencyKey: key, ...wagerPayload(input) }),
+    };
     const requestedId = crypto.randomUUID();
     const proposed = WagerTransaction.create({ ...input, id: requestedId, idempotencyKey: key, payloadHash });
     try {
       return await this.orm.em.fork().transactional(async em => {
+        const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(em, inboxIdentity);
+        if (inbox?.message.isProcessed()) {
+          if (!inbox.result) throw new Error('A processed inbox message must have a persisted response');
+          return this.completeSubmission(em, inbox.message, { ...inbox.result, idempotentReplay: true });
+        }
         await em.execute(`insert into dwp.wager_transactions
           (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
            wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
@@ -108,7 +133,7 @@ export class WageringService {
         const transaction = this.transactionFromRow(row);
         if (transaction.isTerminal()) {
           if (!row.result) throw new Error('A terminal transaction must have a persisted response');
-          return { ...row.result, idempotentReplay: true };
+          return this.completeSubmission(em, inbox?.message, { ...row.result, idempotentReplay: true });
         }
 
         // Foreign-key inserts hold KEY SHARE. NO KEY UPDATE serializes balance
@@ -201,8 +226,7 @@ export class WageringService {
           transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null,
           transaction.referenceTransactionId ?? null, retries, nextAttempt, transaction.id,
         ]);
-        await this.options.beforeCommit?.();
-        return result;
+        return this.completeSubmission(em, inbox?.message, result);
       });
     } catch (error) {
       if (error instanceof ForeignKeyConstraintViolationException) {
@@ -210,6 +234,37 @@ export class WageringService {
       }
       throw error;
     }
+  }
+
+  private async receiveInbox(em: EntityManager, identity: InboxContext & { payloadHash: string }): Promise<{
+    message: InboxMessage; result: SubmissionResult | null;
+  }> {
+    const proposed = InboxMessage.receive(identity);
+    await em.execute(`insert into dwp.inbox_messages (consumer_name, message_id, payload_hash)
+      values (?, ?, ?) on conflict do nothing`, [proposed.consumerName, proposed.messageId, proposed.payloadHash]);
+    const row = (await em.execute<InboxRow[]>(`select * from dwp.inbox_messages
+      where consumer_name = ? and message_id = ? for update`, [identity.consumerName, identity.messageId]))[0];
+    if (!row) throw new Error('The inbox identity must exist after insert');
+    if (row.payload_hash !== identity.payloadHash) {
+      throw new HttpException({ code: 'INBOX_MESSAGE_CONFLICT', message: 'This message identity was used for a different payload or idempotency key' }, 409);
+    }
+    return {
+      message: InboxMessage.rehydrate({
+        consumerName: row.consumer_name, messageId: row.message_id, payloadHash: row.payload_hash,
+        receivedAt: new Date(row.received_at), processedAt: row.processed_at ? new Date(row.processed_at) : undefined,
+      }),
+      result: row.result,
+    };
+  }
+
+  private async completeSubmission(em: EntityManager, inbox: InboxMessage | undefined, result: SubmissionResult): Promise<SubmissionResult> {
+    if (inbox && !inbox.isProcessed()) {
+      inbox.markProcessed(new Date());
+      await em.execute(`update dwp.inbox_messages set processed_at = ?, result = ?::jsonb
+        where consumer_name = ? and message_id = ?`, [inbox.processedAt, JSON.stringify(result), inbox.consumerName, inbox.messageId]);
+    }
+    await this.options.beforeCommit?.();
+    return result;
   }
 
   private transactionFromRow(row: TransactionRow): WagerTransaction {
