@@ -17,7 +17,8 @@
     "queues:init": "bun run build && bun dist/infrastructure/messaging/bootstrap-queues.js",
     "migration:up": "bun run build && bun dist/infrastructure/persistence/migrate.js up",
     "migration:down": "bun run build && bun dist/infrastructure/persistence/migrate.js down",
-    "test:integration": "bun run build && DWP_INTEGRATION=1 bun test test/infrastructure"
+    "test:integration": "bun run build && DWP_INTEGRATION=1 bun test test/infrastructure",
+    "start:publisher": "WORKER_ROLE=publisher bun dist/worker.js"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "3.1156.0",
