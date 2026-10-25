@@ -58,6 +58,7 @@ interface TransactionRow {
   failure_code: string | null;
   result: SubmissionResult | null;
   retry_count: number;
+  next_attempt_at: string;
   created_at: string;
   processed_at: string | null;
 }
@@ -103,8 +104,7 @@ export class WageringService {
       messageId: text(inboxContext.messageId, 'messageId'),
       payloadHash: canonicalHash({ idempotencyKey: key, ...wagerPayload(input) }),
     };
-    const requestedId = crypto.randomUUID();
-    const proposed = WagerTransaction.create({ ...input, id: requestedId, idempotencyKey: key, payloadHash });
+    const proposed = WagerTransaction.create({ ...input, id: crypto.randomUUID(), idempotencyKey: key, payloadHash });
     try {
       return await this.orm.em.fork().transactional(async em => {
         const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(em, inboxIdentity);
@@ -115,11 +115,11 @@ export class WageringService {
         await em.execute(`insert into dwp.wager_transactions
           (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
            wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
-           reference_external_transaction_id, status, created_at)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?) on conflict do nothing`, [
-          requestedId, input.providerId, input.externalTransactionId, key, payloadHash,
+           reference_external_transaction_id, status)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') on conflict do nothing`, [
+          proposed.id, input.providerId, input.externalTransactionId, key, payloadHash,
           input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
-          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null, proposed.createdAt,
+          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null,
         ]);
         // A duplicate blocks on the unique index before acquiring the same row lock.
         // Every entry point takes this transaction lock before the wallet lock.
@@ -130,103 +130,7 @@ export class WageringService {
         if (row.payload_hash !== payloadHash) {
           throw new HttpException({ code: 'IDEMPOTENCY_CONFLICT', message: 'This idempotency key was used for a different business payload' }, 409);
         }
-        const transaction = this.transactionFromRow(row);
-        if (transaction.isTerminal()) {
-          if (!row.result) throw new Error('A terminal transaction must have a persisted response');
-          return this.completeSubmission(em, inbox?.message, { ...row.result, idempotentReplay: true });
-        }
-
-        // Foreign-key inserts hold KEY SHARE. NO KEY UPDATE serializes balance
-        // writes while remaining compatible with those locks on other requests.
-        await em.execute('select id from dwp.wallets where id = ? for no key update', [input.walletId]);
-        const record = await em.findOne(WalletRecord, { id: input.walletId });
-        if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
-        const wallet = this.walletFromRecord(record);
-        const at = new Date();
-        let movement: WalletMovement | undefined;
-        let reference: WagerTransaction | undefined;
-        let referencePending = false;
-        try {
-          if (wallet.playerId !== transaction.playerId) throw new DomainError('WALLET_PLAYER_MISMATCH', 'The wallet belongs to a different player');
-          if (wallet.currency !== transaction.money.currency) throw new DomainError('CURRENCY_MISMATCH', 'The operation currency must match the wallet currency');
-          if (transaction.referenceExternalTransactionId !== undefined) {
-            const referenceRow = (await em.execute<TransactionRow[]>(`select * from dwp.wager_transactions
-              where provider_id = ? and external_transaction_id = ?`, [transaction.providerId, transaction.referenceExternalTransactionId]))[0];
-            if (referenceRow) {
-              reference = this.transactionFromRow(referenceRow);
-              try {
-                transaction.validateReference(reference);
-              } catch (error) {
-                if (!(error instanceof DomainError) || error.code !== 'REFERENCE_PENDING') throw error;
-                referencePending = true;
-              }
-            } else {
-              referencePending = true;
-            }
-          }
-          if (referencePending) {
-            transaction.markPendingReference();
-          } else if (!transaction.affectsBalance()) {
-            transaction.markProcessed(reference?.id, at);
-          } else {
-            if (transaction.requiresReference() && reference) {
-              const existing = await em.execute<{ id: string }[]>(`select id from dwp.wager_transactions
-                where reference_transaction_id = ? and kind = ? and status = 'PROCESSED' limit 1`, [reference.id, transaction.kind]);
-              if (existing.length > 0) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference was already reversed by this operation kind');
-            }
-            movement = transaction.ledgerDirectionFor(reference) === LedgerDirection.Debit
-              ? wallet.debit(transaction.money, at)
-              : wallet.credit(transaction.money, at);
-          }
-        } catch (error) {
-          if (!(error instanceof DomainError) || ![
-            'WALLET_PLAYER_MISMATCH', 'CURRENCY_MISMATCH', 'INSUFFICIENT_FUNDS', 'MONEY_OVERFLOW', 'WALLET_VERSION_OVERFLOW',
-            'REFERENCE_MISMATCH', 'REFERENCE_REJECTED', 'REFERENCE_FAILED', 'INVALID_REFERENCE_KIND',
-            'REFERENCE_AMOUNT_MISMATCH', 'REVERSAL_ALREADY_PROCESSED',
-          ].includes(error.code)) throw error;
-          const failureCode = transaction.kind === WagerTransactionKind.Rollback && error.code === 'INSUFFICIENT_FUNDS'
-            ? 'REVERSAL_INSUFFICIENT_FUNDS'
-            : error.code;
-          transaction.reject(failureCode);
-        }
-
-        const context = { correlationId: transaction.id, occurredAt: at };
-        if (movement) {
-          transaction.markProcessed(reference?.id, at);
-          record.balanceCents = wallet.balance.cents;
-          record.version = wallet.version;
-          record.updatedAt = wallet.updatedAt;
-          await em.flush();
-          const entry = WalletLedgerEntry.create({
-            id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
-            direction: transaction.ledgerDirectionFor(reference), money: transaction.money,
-            ...movement, createdAt: at,
-          });
-          await this.insertLedger(em, entry);
-          await this.enqueue(em, WalletBalanceChanged.from(wallet, entry, context));
-          await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
-        } else if (referencePending) {
-          if (row.status !== WagerTransactionStatus.PendingReference) {
-            await this.enqueue(em, WagerTransactionPendingReference.from(transaction, context));
-          }
-        } else if (transaction.status === WagerTransactionStatus.Processed) {
-          await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
-        } else {
-          await this.enqueue(em, WagerTransactionRejected.from(transaction, context));
-        }
-        const result: SubmissionResult = {
-          transactionId: transaction.id, status: transaction.status,
-          balance: wallet.balance.toJSON(), idempotentReplay: false,
-          ...(transaction.failureCode === undefined ? {} : { failureCode: transaction.failureCode }),
-        };
-        const retries = row.retry_count + (referencePending ? 1 : 0);
-        const nextAttempt = new Date(at.getTime() + Math.min(60, 2 ** Math.min(row.retry_count, 6)) * 1_000);
-        await em.execute(`update dwp.wager_transactions set status = ?, failure_code = ?,
-          result = ?::jsonb, processed_at = ?, reference_transaction_id = ?, retry_count = ?, next_attempt_at = ? where id = ?`, [
-          transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null,
-          transaction.referenceTransactionId ?? null, retries, nextAttempt, transaction.id,
-        ]);
-        return this.completeSubmission(em, inbox?.message, result);
+        return this.processTransaction(em, row, inbox?.message);
       });
     } catch (error) {
       if (error instanceof ForeignKeyConstraintViolationException) {
@@ -234,6 +138,130 @@ export class WageringService {
       }
       throw error;
     }
+  }
+
+  async reprocess(id: string): Promise<SubmissionResult | undefined> {
+    const transactionId = uuid(id, 'transactionId');
+    return this.orm.em.fork().transactional(async em => {
+      const row = (await em.execute<TransactionRow[]>(
+        'select * from dwp.wager_transactions where id = ? for update', [transactionId],
+      ))[0];
+      if (!row || row.status !== WagerTransactionStatus.PendingReference) return undefined;
+      // Selection by another worker is advisory; only the locked row decides
+      // whether a retry is still due after another process has completed it.
+      const now = await this.databaseNow(em);
+      if (new Date(row.next_attempt_at).getTime() > now.getTime()) return undefined;
+      return this.processTransaction(em, row);
+    });
+  }
+
+  private async databaseNow(em: EntityManager): Promise<Date> {
+    const row = (await em.execute<{ now: string }[]>('select clock_timestamp() as now'))[0];
+    if (!row) throw new Error('The database clock must return a timestamp');
+    return new Date(row.now);
+  }
+
+  private async processTransaction(em: EntityManager, row: TransactionRow, inbox?: InboxMessage): Promise<SubmissionResult> {
+    const transaction = this.transactionFromRow(row);
+    if (transaction.isTerminal()) {
+      if (!row.result) throw new Error('A terminal transaction must have a persisted response');
+      return this.completeSubmission(em, inbox, { ...row.result, idempotentReplay: true });
+    }
+
+    // Foreign-key inserts hold KEY SHARE. NO KEY UPDATE serializes balance
+    // writes while remaining compatible with those locks on other requests.
+    await em.execute('select id from dwp.wallets where id = ? for no key update', [row.wallet_id]);
+    const record = await em.findOne(WalletRecord, { id: row.wallet_id });
+    if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+    const wallet = this.walletFromRecord(record);
+    const at = await this.databaseNow(em);
+    let movement: WalletMovement | undefined;
+    let reference: WagerTransaction | undefined;
+    let referencePending = false;
+    try {
+      if (wallet.playerId !== transaction.playerId) throw new DomainError('WALLET_PLAYER_MISMATCH', 'The wallet belongs to a different player');
+      if (wallet.currency !== transaction.money.currency) throw new DomainError('CURRENCY_MISMATCH', 'The operation currency must match the wallet currency');
+      if (transaction.referenceExternalTransactionId !== undefined) {
+        if (at.getTime() - transaction.createdAt.getTime() >= 24 * 60 * 60 * 1_000) {
+          throw new DomainError('REFERENCE_EXPIRED', 'The reference did not resolve within twenty-four hours');
+        }
+        const referenceRow = (await em.execute<TransactionRow[]>(`select * from dwp.wager_transactions
+          where provider_id = ? and external_transaction_id = ?`, [transaction.providerId, transaction.referenceExternalTransactionId]))[0];
+        if (referenceRow) {
+          reference = this.transactionFromRow(referenceRow);
+          try {
+            transaction.validateReference(reference);
+          } catch (error) {
+            if (!(error instanceof DomainError) || error.code !== 'REFERENCE_PENDING') throw error;
+            referencePending = true;
+          }
+        } else {
+          referencePending = true;
+        }
+      }
+      if (referencePending) {
+        transaction.markPendingReference();
+      } else if (!transaction.affectsBalance()) {
+        transaction.markProcessed(reference?.id, at);
+      } else {
+        if (transaction.requiresReference() && reference) {
+          const existing = await em.execute<{ id: string }[]>(`select id from dwp.wager_transactions
+            where reference_transaction_id = ? and kind = ? and status = 'PROCESSED' limit 1`, [reference.id, transaction.kind]);
+          if (existing.length > 0) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference was already reversed by this operation kind');
+        }
+        movement = transaction.ledgerDirectionFor(reference) === LedgerDirection.Debit
+          ? wallet.debit(transaction.money, at)
+          : wallet.credit(transaction.money, at);
+      }
+    } catch (error) {
+      if (!(error instanceof DomainError) || ![
+        'WALLET_PLAYER_MISMATCH', 'CURRENCY_MISMATCH', 'INSUFFICIENT_FUNDS', 'MONEY_OVERFLOW', 'WALLET_VERSION_OVERFLOW',
+        'REFERENCE_MISMATCH', 'REFERENCE_REJECTED', 'REFERENCE_FAILED', 'INVALID_REFERENCE_KIND',
+        'REFERENCE_AMOUNT_MISMATCH', 'REVERSAL_ALREADY_PROCESSED', 'REFERENCE_EXPIRED',
+      ].includes(error.code)) throw error;
+      const failureCode = transaction.kind === WagerTransactionKind.Rollback && error.code === 'INSUFFICIENT_FUNDS'
+        ? 'REVERSAL_INSUFFICIENT_FUNDS'
+        : error.code;
+      transaction.reject(failureCode);
+    }
+
+    const context = { correlationId: transaction.id, occurredAt: at };
+    if (movement) {
+      transaction.markProcessed(reference?.id, at);
+      record.balanceCents = wallet.balance.cents;
+      record.version = wallet.version;
+      record.updatedAt = wallet.updatedAt;
+      await em.flush();
+      const entry = WalletLedgerEntry.create({
+        id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
+        direction: transaction.ledgerDirectionFor(reference), money: transaction.money,
+        ...movement, createdAt: at,
+      });
+      await this.insertLedger(em, entry);
+      await this.enqueue(em, WalletBalanceChanged.from(wallet, entry, context));
+      await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
+    } else if (referencePending) {
+      if (row.status !== WagerTransactionStatus.PendingReference) {
+        await this.enqueue(em, WagerTransactionPendingReference.from(transaction, context));
+      }
+    } else if (transaction.status === WagerTransactionStatus.Processed) {
+      await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
+    } else {
+      await this.enqueue(em, WagerTransactionRejected.from(transaction, context));
+    }
+    const result: SubmissionResult = {
+      transactionId: transaction.id, status: transaction.status,
+      balance: wallet.balance.toJSON(), idempotentReplay: false,
+      ...(transaction.failureCode === undefined ? {} : { failureCode: transaction.failureCode }),
+    };
+    const retries = row.retry_count + (referencePending ? 1 : 0);
+    const nextAttempt = new Date(at.getTime() + Math.min(60, 2 ** Math.min(row.retry_count, 6)) * 1_000);
+    await em.execute(`update dwp.wager_transactions set status = ?, failure_code = ?,
+      result = ?::jsonb, processed_at = ?, reference_transaction_id = ?, retry_count = ?, next_attempt_at = ? where id = ?`, [
+      transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null,
+      transaction.referenceTransactionId ?? null, retries, nextAttempt, transaction.id,
+    ]);
+    return this.completeSubmission(em, inbox, result);
   }
 
   async failSubmission(body: unknown, idempotencyKey: unknown, failureCode: string, inboxContext?: InboxContext): Promise<SubmissionResult> {
@@ -258,11 +286,11 @@ export class WageringService {
         await em.execute(`insert into dwp.wager_transactions
           (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
            wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
-           reference_external_transaction_id, status, created_at)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?) on conflict do nothing`, [
+           reference_external_transaction_id, status)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') on conflict do nothing`, [
           proposed.id, input.providerId, input.externalTransactionId, key, payloadHash,
           input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
-          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null, proposed.createdAt,
+          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null,
         ]);
         const row = (await em.execute<TransactionRow[]>(
           'select * from dwp.wager_transactions where idempotency_key = ? for update', [key],
