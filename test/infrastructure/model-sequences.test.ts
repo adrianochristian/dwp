@@ -17,7 +17,7 @@ interface Step {
   action: Action;
   kind: Exclude<OracleKind, 'OPENING'>;
   wallet: number;
-  cents: number;
+  cents: bigint;
   referenceMode: number;
   selector: number;
   alignReference: boolean;
@@ -44,14 +44,14 @@ interface TransactionRow {
 const stepArbitrary: fc.Arbitrary<Step> = fc.record({
   action: fc.constantFrom<Action>('new', 'new', 'new', 'replay', 'payload_conflict', 'external_conflict', 'redelivery', 'inbox_conflict', 'retry_pending', 'deliver_reference', 'fail'),
   kind: fc.constantFrom<Step['kind']>('BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK'),
-  wallet: fc.integer({ min: 0, max: 2 }), cents: fc.integer({ min: 0, max: 20_000 }),
+  wallet: fc.integer({ min: 0, max: 2 }), cents: fc.bigInt({ min: 0n, max: 20_000n }),
   referenceMode: fc.integer({ min: 0, max: 3 }), selector: fc.integer({ min: 0, max: 40 }),
   alignReference: fc.boolean(), inbox: fc.boolean(), provider: fc.integer({ min: 0, max: 1 }),
   round: fc.integer({ min: 0, max: 1 }), identityError: fc.integer({ min: 0, max: 11 }),
 });
 
 const guided = (patch: Partial<Step>): Step => ({
-  action: 'new', kind: 'BET', wallet: 1, cents: 1_000, referenceMode: 0,
+  action: 'new', kind: 'BET', wallet: 1, cents: 1_000n, referenceMode: 0,
   selector: 0, alignReference: true, inbox: false, provider: 0, round: 0, identityError: 2, ...patch,
 });
 
@@ -60,13 +60,13 @@ const guided = (patch: Partial<Step>): Step => ({
 // commands and can shrink that suffix to a reproducible counterexample.
 const mixedPrefix: Step[] = [
   guided({}),
-  guided({ kind: 'WIN', cents: 2_000, referenceMode: 1 }),
-  guided({ kind: 'LOSS', cents: 0, referenceMode: 1 }),
+  guided({ kind: 'WIN', cents: 2_000n, referenceMode: 1 }),
+  guided({ kind: 'LOSS', cents: 0n, referenceMode: 1 }),
   guided({ kind: 'REFUND', referenceMode: 1 }),
   guided({ kind: 'ROLLBACK', referenceMode: 1 }),
-  guided({ kind: 'ROLLBACK', cents: 2_000, referenceMode: 1, selector: 1 }),
-  guided({ kind: 'ROLLBACK', cents: 1_000, referenceMode: 1, selector: 2 }),
-  guided({ kind: 'REFUND', cents: 700, referenceMode: 3, inbox: true }),
+  guided({ kind: 'ROLLBACK', cents: 2_000n, referenceMode: 1, selector: 1 }),
+  guided({ kind: 'ROLLBACK', cents: 1_000n, referenceMode: 1, selector: 2 }),
+  guided({ kind: 'REFUND', cents: 700n, referenceMode: 3, inbox: true }),
   guided({ action: 'deliver_reference' }),
   guided({ action: 'retry_pending' }),
   guided({ action: 'redelivery' }),
@@ -123,7 +123,7 @@ function buildRequest(step: Step, state: OracleState, namespace: string, index: 
   let body: OracleBody = {
     providerId: `provider-${step.provider}`, externalTransactionId: `${namespace}:external:${index}`,
     walletId: wallet.id, playerId: wallet.playerId, roundId: `round-${step.round}`, gameId: 'generated-game', kind,
-    money: { amount: decimal(BigInt(kind === 'LOSS' ? step.cents : Math.max(1, step.cents))), currency: 'BRL' },
+    money: { amount: decimal(kind === 'LOSS' || step.cents > 0n ? step.cents : 1n), currency: 'BRL' },
   };
   if (kind !== 'BET' && (step.referenceMode !== 0 || ['REFUND', 'ROLLBACK'].includes(kind))) {
     const eligibleKinds = kind === 'ROLLBACK' ? ['BET', 'WIN', 'REFUND'] : ['BET'];
@@ -169,6 +169,10 @@ function comparable(value: unknown): unknown {
 }
 
 function bag(values: unknown[]): string[] { return values.map(value => JSON.stringify(comparable(value))).sort(); }
+
+function diagnostic(value: unknown): string {
+  return JSON.stringify(value, (_, item) => typeof item === 'bigint' ? `${item}n` : item) ?? 'undefined';
+}
 
 integration('independent integer-ledger model over generated SQL sequences', () => {
   const databaseName = `dwp_model_${crypto.randomUUID().replaceAll('-', '')}`;
@@ -316,11 +320,10 @@ integration('independent integer-ledger model over generated SQL sequences', () 
           coverage.generatedActions.add(step.action);
         } catch (error) {
           const snapshot = oracle.snapshot();
-          throw new Error(`Model mismatch at seed ${seed}, sequence ${sequence}, step ${index}, descriptor ${JSON.stringify(step)}\n`
-            + `History: ${JSON.stringify(history)}\nModel: ${JSON.stringify({ wallets: [...snapshot.wallets.values()],
+          throw new Error(`Model mismatch at seed ${seed}, sequence ${sequence}, step ${index}, descriptor ${diagnostic(step)}\n`
+            + `History: ${diagnostic(history)}\nModel: ${diagnostic({ wallets: [...snapshot.wallets.values()],
               expected, transactions: snapshot.transactions.size, ledgerEntries: snapshot.ledger.length,
-              events: snapshot.events.length, inboxAcceptances: snapshot.inbox.size }, (_, value) =>
-              typeof value === 'bigint' ? value.toString() : value)}`, { cause: error });
+              events: snapshot.events.length, inboxAcceptances: snapshot.inbox.size })}`, { cause: error });
         }
       }
       coverage.sequences += 1;
