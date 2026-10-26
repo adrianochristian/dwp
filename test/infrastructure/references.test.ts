@@ -4,6 +4,9 @@ import { ReferenceWorker } from '../../dist/application/reference-worker.js';
 import { WageringService } from '../../dist/application/wagering-service.js';
 import { WageringQueries } from '../../dist/application/wagering-queries.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
+import { canonicalHash, wagerPayload, wagerRequest } from '../../dist/application/contracts.js';
+import { WagerTransaction, WagerTransactionStatus } from '../../dist/domain/wager-transaction.js';
+import { WagerTransactionPendingReference } from '../../dist/domain/integration-event.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
 
@@ -70,6 +73,42 @@ integration('durable out-of-order reference processing', () => {
     expect(result.storedBalance).toEqual(result.calculatedBalance);
   }
 
+  async function datedReference(body: unknown, key: string, age: string, status: WagerTransactionStatus.Pending | WagerTransactionStatus.PendingReference) {
+    const input = wagerRequest(body);
+    const id = crypto.randomUUID();
+    const payloadHash = canonicalHash(wagerPayload(input));
+    const wallet = await service.getWallet(input.walletId);
+    const result = { transactionId: id, status, balance: wallet.balance, idempotentReplay: false };
+    return orm.em.fork().transactional(async em => {
+      const [row] = await em.execute<{ created_at: string }[]>(`insert into dwp.wager_transactions
+        (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
+         wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
+         reference_external_transaction_id, status, result, created_at, retry_count, next_attempt_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb,
+          clock_timestamp() - (?::interval), ?, clock_timestamp() - interval '1 second')
+        returning created_at`, [
+        id, input.providerId, input.externalTransactionId, key, payloadHash,
+        input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
+        input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null,
+        status, status === WagerTransactionStatus.PendingReference ? JSON.stringify(result) : null,
+        age, status === WagerTransactionStatus.PendingReference ? 1 : 0,
+      ]);
+      if (status === WagerTransactionStatus.PendingReference) {
+        const transaction = WagerTransaction.rehydrate({
+          ...input, id, idempotencyKey: key, payloadHash, status, createdAt: new Date(row!.created_at),
+        });
+        const event = WagerTransactionPendingReference.from(transaction, {
+          correlationId: id, occurredAt: transaction.createdAt,
+        });
+        await em.execute(`insert into dwp.outbox_messages
+          (id, aggregate_id, event_type, payload, occurred_at) values (?, ?, ?, ?::jsonb, ?)`, [
+          event.eventId, event.aggregateId, event.eventType, JSON.stringify(event.toJSON()), event.occurredAt,
+        ]);
+      }
+      return { ...result, createdAt: row!.created_at };
+    });
+  }
+
   test('processes REFUND and ROLLBACK delivered before their BET through a new worker instance', async () => {
     for (const kind of ['REFUND', 'ROLLBACK']) {
       const { wallet, command } = await fixture();
@@ -134,16 +173,18 @@ integration('durable out-of-order reference processing', () => {
 
   test('expires references after twenty-four hours from persisted creation despite HTTP retries', async () => {
     const { wallet, command } = await fixture();
+    const nearBody = command('ROLLBACK', '25.00', crypto.randomUUID());
+    const nearKey = crypto.randomUUID();
+    const near = await datedReference(nearBody, nearKey, '23 hours', WagerTransactionStatus.Pending);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      expect((await service.submit(nearBody, nearKey)).status).toBe('PENDING_REFERENCE');
+      expect((await query<{ created_at: string }>('select created_at from dwp.wager_transactions where id = ?', [near.transactionId]))[0]!.created_at).toBe(near.createdAt);
+    }
+    expect(await events(near.transactionId, 'WagerTransactionPendingReference')).toBe(1);
+    await query("update dwp.wager_transactions set next_attempt_at = clock_timestamp() + interval '1 hour' where id = ?", [near.transactionId]);
     const body = command('ROLLBACK', '25.00', crypto.randomUUID());
     const key = crypto.randomUUID();
-    const pending = await service.submit(body, key);
-    await query(`update dwp.wager_transactions set created_at = clock_timestamp() - interval '23 hours',
-      next_attempt_at = clock_timestamp() - interval '1 second' where id = ?`, [pending.transactionId]);
-    const createdAt = (await query<{ created_at: string }>('select created_at from dwp.wager_transactions where id = ?', [pending.transactionId]))[0]!.created_at;
-    expect((await service.submit(body, key)).status).toBe('PENDING_REFERENCE');
-    expect((await query<{ created_at: string }>('select created_at from dwp.wager_transactions where id = ?', [pending.transactionId]))[0]!.created_at).toBe(createdAt);
-    await query(`update dwp.wager_transactions set created_at = clock_timestamp() - interval '24 hours 1 second',
-      next_attempt_at = clock_timestamp() - interval '1 second' where id = ?`, [pending.transactionId]);
+    const pending = await datedReference(body, key, '24 hours 1 second', WagerTransactionStatus.PendingReference);
     const worker = new ReferenceWorker(orm, service);
     expect(await worker.runOnce()).toBe(1);
     await worker.stop();

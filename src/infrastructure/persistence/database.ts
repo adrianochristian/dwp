@@ -4,6 +4,7 @@ import { Migration20261025000100 } from './migrations/Migration20261025000100.js
 import { Migration20261025000200 } from './migrations/WageringSchema.js';
 import { Migration20261025000300 } from './migrations/Migration20261025000300.js';
 import { Migration20261026000100 } from './migrations/Migration20261026000100.js';
+import { Migration20261026000200 } from './migrations/Migration20261026000200.js';
 import { WalletRecordSchema } from './records.js';
 
 export async function createDatabase(databaseUrl?: string): Promise<MikroORM> {
@@ -13,7 +14,7 @@ export async function createDatabase(databaseUrl?: string): Promise<MikroORM> {
     discovery: { warnWhenNoEntities: false },
     extensions: [Migrator],
     migrations: {
-      migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300, Migration20261026000100],
+      migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300, Migration20261026000100, Migration20261026000200],
       tableName: 'mikro_orm_migrations',
       snapshot: false,
       snapshotOnMigrate: false,

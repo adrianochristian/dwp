@@ -7,6 +7,7 @@ import { Migration20261025000100 } from '../../dist/infrastructure/persistence/m
 import { Migration20261025000200 } from '../../dist/infrastructure/persistence/migrations/WageringSchema.js';
 import { Migration20261025000300 } from '../../dist/infrastructure/persistence/migrations/Migration20261025000300.js';
 import { Migration20261026000100 } from '../../dist/infrastructure/persistence/migrations/Migration20261026000100.js';
+import { Migration20261026000200 } from '../../dist/infrastructure/persistence/migrations/Migration20261026000200.js';
 import { WalletRecord, WalletRecordSchema } from '../../dist/infrastructure/persistence/records.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -26,7 +27,7 @@ integration('database financial constraints', () => {
       entities: [WalletRecordSchema],
       extensions: [Migrator],
       migrations: {
-        migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300, Migration20261026000100],
+        migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300, Migration20261026000100, Migration20261026000200],
         snapshot: false,
         snapshotOnMigrate: false,
       },
