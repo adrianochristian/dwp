@@ -195,6 +195,21 @@ interface TrafficResult {
   latencyMs: { p50: number; p95: number; p99: number; max: number; resolution: number };
 }
 
+interface TrafficCounts { requests: number; successful: number; errors: number; unexpectedReplays: number }
+
+export function validateTraffic(measurements: readonly TrafficCounts[], warmup: TrafficCounts, persistedBets: string) {
+  const measured = measurements.reduce((sum, value) => ({ requests: sum.requests + value.requests,
+    successful: sum.successful + value.successful, errors: sum.errors + value.errors,
+    unexpectedReplays: sum.unexpectedReplays + value.unexpectedReplays }),
+  { requests: 0, successful: 0, errors: 0, unexpectedReplays: 0 });
+  const expectedBets = warmup.successful + measured.successful;
+  return { warmup, measured, expectedBets, persistedBets,
+    consistent: measurements.length === 6 && measurements.every(value => value.requests > 0)
+      && measured.errors === 0 && measured.unexpectedReplays === 0 && measured.successful === measured.requests
+      && warmup.errors === 0 && warmup.unexpectedReplays === 0 && warmup.successful === warmup.requests
+      && BigInt(persistedBets) === BigInt(expectedBets) };
+}
+
 async function traffic(
   duration: number,
   wallets: readonly Wallet[],
@@ -331,6 +346,8 @@ async function main(): Promise<void> {
   let requestSequence = 0;
   let walletCount = 0;
   const measurements: Record<string, unknown>[] = [];
+  const trafficMeasurements: TrafficCounts[] = [];
+  const warmupTraffic: TrafficCounts = { requests: 0, successful: 0, errors: 0, unexpectedReplays: 0 };
   const startedAt = new Date().toISOString();
   try {
     admin = await createDatabase();
@@ -363,7 +380,11 @@ async function main(): Promise<void> {
         ));
         walletCount += wallets.length;
         progress('load_warmup_started', { scenario, concurrency, seconds: warmupSeconds });
-        await traffic(warmupSeconds, wallets, concurrency, instances, () => `${runId}:${++requestSequence}`, () => interrupted);
+        const warmup = await traffic(warmupSeconds, wallets, concurrency, instances, () => `${runId}:${++requestSequence}`, () => interrupted);
+        warmupTraffic.requests += warmup.requests;
+        warmupTraffic.successful += warmup.successful;
+        warmupTraffic.errors += warmup.errors;
+        warmupTraffic.unexpectedReplays += warmup.unexpectedReplays;
         const conflictsBefore = await lockConflicts(instances);
         const deadlocksBefore = await deadlocks(orm);
         const lagBefore = await outboxLag(orm);
@@ -399,6 +420,7 @@ async function main(): Promise<void> {
         try {
           result = await traffic(measurementSeconds, wallets, concurrency, instances, () => `${runId}:${++requestSequence}`, () => interrupted);
         } finally { sampling = false; stopSampling(); await sampler; }
+        trafficMeasurements.push(result);
         const cpu = process.cpuUsage(cpuBefore);
         const conflictsAfter = await lockConflicts(instances);
         const lagAfter = await outboxLag(orm);
@@ -445,6 +467,7 @@ async function main(): Promise<void> {
     instances.length = 0;
     finalLag = await outboxLag(orm);
     const reconciliation = await reconcile(orm, initialBalance, walletCount);
+    const trafficValidation = validateTraffic(trafficMeasurements, warmupTraffic, reconciliation.counts.transactions);
     const queueAttributes = await sqsCall(signal => sqs.send(new GetQueueAttributesCommand({
       QueueUrl: queueUrl, AttributeNames: ['ApproximateNumberOfMessages'],
     }), { abortSignal: signal }));
@@ -476,14 +499,15 @@ async function main(): Promise<void> {
         publisherMetrics: perPublisherMetrics, publisherExitCodes,
       },
       reconciliation,
+      traffic: trafficValidation,
       apiProcessesSurvived: apiProcessesRunning,
       publisherProcessesSurvived: publisherProcessesRunning,
       complete: !interrupted && apiProcessesRunning && publisherProcessesRunning && publisherExitCodes.every(code => code === 0)
-        && reconciliation.consistent && drainedWithinBudget && finalLag.pending === 0,
+        && reconciliation.consistent && trafficValidation.consistent && drainedWithinBudget && finalLag.pending === 0,
     };
     await Bun.write(reportPath, `${JSON.stringify(report, null, 2)}\n`);
     progress('load_report_written', { reportPath, complete: report.complete });
-    if (!report.complete) throw new LoadExperimentError('VALIDATION_FAILED', 'Reconciliation or outbox drain failed; inspect the load report');
+    if (!report.complete) throw new LoadExperimentError('VALIDATION_FAILED', 'Traffic, process, reconciliation or outbox validation failed; inspect the load report');
   } finally {
     await Promise.allSettled(publishers.map(stopInstance));
     await Promise.allSettled(instances.map(stopInstance));

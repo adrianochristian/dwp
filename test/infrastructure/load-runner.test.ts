@@ -33,6 +33,8 @@ integration('the load runner measures three APIs and two real publishers using t
     expect(report.outbox.drainedWithinBudget).toBe(true);
     expect(report.outbox.remainingAtDrainDeadline).toBe(0);
     expect(report.reconciliation.consistent).toBe(true);
+    expect(report.traffic.consistent).toBe(true);
+    expect(report.traffic.expectedBets).toBe(Number(report.reconciliation.counts.transactions));
     expect(report.measurements).toHaveLength(6);
     for (const measurement of report.measurements) {
       expect(measurement.errors).toBe(0);
