@@ -17,7 +17,7 @@ export function object(value: unknown, field = 'body'): Record<string, unknown> 
 
 export function text(value: unknown, field: string, maximum = 200): string {
   if (typeof value !== 'string' || value.length === 0 || value.length > maximum
-    || value.trim() !== value || /[\u0000-\u001f]/.test(value)) {
+    || value.trim() !== value || /[\u0000-\u001f]/.test(value) || /[\uD800-\uDFFF]/u.test(value)) {
     invalidRequest(`${field} must be a nonempty string of at most ${maximum} characters`);
   }
   return value;
