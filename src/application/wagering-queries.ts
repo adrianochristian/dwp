@@ -103,7 +103,6 @@ export class WageringQueries {
     if (!snapshot) throw new ApplicationError('not_found', 'WALLET_NOT_FOUND', 'The wallet does not exist');
     const difference = snapshot.storedBalance.subtract(snapshot.calculatedBalance);
     const consistent = difference.isZero();
-    if (!consistent) console.error(JSON.stringify({ event: 'wallet_reconciliation_inconsistent', walletId }));
     return {
       walletId, storedBalance: snapshot.storedBalance.toJSON(), calculatedBalance: snapshot.calculatedBalance.toJSON(),
       difference: difference.toJSON(), consistent, checkedEntries: snapshot.checkedEntries,

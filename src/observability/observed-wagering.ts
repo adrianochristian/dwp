@@ -1,13 +1,22 @@
 import { HttpException } from '@nestjs/common';
-import { wagerRequest } from '../application/contracts.js';
+import { uuid, wagerRequest } from '../application/contracts.js';
 import type { WageringReadUseCases } from '../application/wagering-queries.js';
 import type { WageringUseCases, InboxContext, SubmissionResult } from '../application/wagering-service.js';
 import { ApplicationError } from '../application/application-error.js';
 import { DomainError } from '../domain/domain-error.js';
 import { log, type LogContext } from './logger.js';
 import { metrics } from './metrics.js';
+import { errorChain, isInfrastructureFailure } from '../infrastructure/failure-classification.js';
 
 type ProcessingRole = 'http' | 'sqs' | 'reference';
+
+function diagnose(action: () => void): void {
+  try { action(); } catch { /* Diagnostics cannot replace a use-case result or error. */ }
+}
+
+function safeContext(read: () => LogContext): LogContext {
+  try { return read(); } catch { return {}; }
+}
 
 function fields(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' ? value as Record<string, unknown> : undefined;
@@ -34,15 +43,16 @@ function failure(error: unknown): { code: string; lockConflict: boolean } {
   } else if (error instanceof DomainError) {
     code = error.code;
   }
+  if (code === undefined && isInfrastructureFailure(errorChain(error))) code = 'INFRASTRUCTURE_UNAVAILABLE';
   return {
-    code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,99}$/.test(code) ? code : 'INFRASTRUCTURE_UNAVAILABLE',
+    code: typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,99}$/.test(code) ? code : 'INTERNAL_ERROR',
     lockConflict: false,
   };
 }
 
 function identifiers(body: unknown, context?: InboxContext): LogContext {
-  // Validation has already succeeded before the financial commit. A malformed
-  // or subsequently changed caller object must never turn logging into a failure.
+  // Capture only validated identifiers before execution; request bodies and
+  // idempotency keys are never copied into diagnostic context.
   try {
     const input = wagerRequest(body);
     return {
@@ -70,32 +80,34 @@ export class ObservedWageringService implements WageringUseCases {
   }
 
   async reprocess(id: string): Promise<SubmissionResult | undefined> {
-    return this.observed(() => this.inner.reprocess(id));
+    return this.observed(() => this.inner.reprocess(id), () => ({ transactionId: uuid(id, 'transactionId') }));
   }
 
   private async observed<T extends SubmissionResult | undefined>(work: () => Promise<T>, context: () => LogContext = () => ({})): Promise<T> {
     const started = performance.now();
-    const correlationId = crypto.randomUUID();
+    const identifiers = safeContext(context);
+    const correlationId = identifiers.transactionId ?? crypto.randomUUID();
+    let result: T;
     try {
-      const result = await work();
-      if (result === undefined) return result;
-      const durationMs = performance.now() - started;
-      metrics.observeDuration(durationMs / 1_000, { role: this.role, status: result.status });
-      metrics.increment(result.idempotentReplay ? 'duplicates' : 'transactions', { role: this.role, status: result.status });
-      log(result.idempotentReplay ? 'wager_transaction_replayed' : 'wager_transaction_completed', {
-        ...context(), correlationId: result.transactionId, transactionId: result.transactionId,
-        status: result.status, durationMs,
-        ...(result.failureCode ? { code: result.failureCode } : {}),
-      });
-      return result;
+      result = await work();
     } catch (error) {
       const durationMs = performance.now() - started;
       const detail = failure(error);
-      metrics.observeDuration(durationMs / 1_000, { role: this.role });
-      if (detail.lockConflict) metrics.increment('lock_conflicts', { role: this.role });
-      log('wager_transaction_error', { correlationId, code: detail.code, durationMs });
+      diagnose(() => metrics.observeDuration(durationMs / 1_000, { role: this.role }));
+      if (detail.lockConflict) diagnose(() => metrics.increment('lock_conflicts', { role: this.role }));
+      log('wager_transaction_error', { ...identifiers, correlationId, code: detail.code, durationMs });
       throw error;
     }
+    if (result === undefined) return result;
+    const completed = result;
+    const durationMs = performance.now() - started;
+    diagnose(() => metrics.observeDuration(durationMs / 1_000, { role: this.role, status: completed.status }));
+    diagnose(() => metrics.increment(completed.idempotentReplay ? 'duplicates' : 'transactions', { role: this.role, status: completed.status }));
+    log(result.idempotentReplay ? 'wager_transaction_replayed' : 'wager_transaction_completed', {
+      ...identifiers, correlationId: result.transactionId, transactionId: result.transactionId,
+      status: result.status, durationMs, ...(result.failureCode ? { code: result.failureCode } : {}),
+    });
+    return result;
   }
 }
 
@@ -113,22 +125,27 @@ export class ObservedWageringQueries implements WageringReadUseCases {
   async reconcile(id: string) {
     const started = performance.now();
     const correlationId = crypto.randomUUID();
+    const identifiers = safeContext(() => ({ walletId: uuid(id, 'walletId') }));
+    let result: Awaited<ReturnType<WageringReadUseCases['reconcile']>>;
     try {
-      const result = await this.inner.reconcile(id);
-      const durationMs = performance.now() - started;
-      metrics.observeDuration(durationMs / 1_000, { role: 'http' });
-      if (!result.consistent) metrics.increment('reconciliation_inconsistencies', { role: 'http' });
-      log('wallet_reconciliation_completed', {
-        correlationId, walletId: result.walletId, durationMs, status: result.consistent ? 'CONSISTENT' : 'INCONSISTENT',
-      });
-      return result;
+      result = await this.inner.reconcile(id);
     } catch (error) {
       const durationMs = performance.now() - started;
       const detail = failure(error);
-      metrics.observeDuration(durationMs / 1_000, { role: 'http' });
-      if (detail.lockConflict) metrics.increment('lock_conflicts', { role: 'http' });
-      log('wallet_reconciliation_error', { correlationId, code: detail.code, durationMs });
+      diagnose(() => metrics.observeDuration(durationMs / 1_000, { role: 'http' }));
+      if (detail.lockConflict) diagnose(() => metrics.increment('lock_conflicts', { role: 'http' }));
+      log('wallet_reconciliation_error', { ...identifiers, correlationId, code: detail.code, durationMs });
       throw error;
     }
+    const durationMs = performance.now() - started;
+    diagnose(() => metrics.observeDuration(durationMs / 1_000, { role: 'http' }));
+    if (!result.consistent) {
+      diagnose(() => metrics.increment('reconciliation_inconsistencies', { role: 'http' }));
+      log('wallet_reconciliation_inconsistent', { correlationId, walletId: result.walletId, status: 'INCONSISTENT' });
+    }
+    log('wallet_reconciliation_completed', {
+      correlationId, walletId: result.walletId, durationMs, status: result.consistent ? 'CONSISTENT' : 'INCONSISTENT',
+    });
+    return result;
   }
 }

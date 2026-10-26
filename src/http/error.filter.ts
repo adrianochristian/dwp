@@ -1,6 +1,7 @@
 import { ArgumentsHost, Catch, HttpException, type ExceptionFilter } from '@nestjs/common';
 import { ApplicationError, type ApplicationErrorKind } from '../application/application-error.js';
 import { DomainError } from '../domain/domain-error.js';
+import { errorChain, isInfrastructureFailure } from '../infrastructure/failure-classification.js';
 
 interface ErrorBody {
   code: string;
@@ -42,46 +43,15 @@ const businessErrors = new Set([
   'REFERENCE_AMOUNT_MISMATCH', 'REVERSAL_ALREADY_PROCESSED', 'REFERENCE_EXPIRED',
 ]);
 
-const infrastructureCodes = new Set([
-  '40P01', '40001', '55P03', '57014', '57P01', '57P02', '57P03',
-  'ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EPIPE',
-  'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH', 'EHOSTUNREACH',
-  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET',
-  'SQS_CALL_TIMEOUT',
-]);
-
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null
     ? value as Record<string, unknown>
     : undefined;
 }
 
-function errorChain(error: unknown): Record<string, unknown>[] {
-  const chain: Record<string, unknown>[] = [];
-  let current = error;
-  for (let depth = 0; depth < 6; depth += 1) {
-    const fields = record(current);
-    if (!fields) break;
-    chain.push(fields);
-    current = fields.cause;
-  }
-  return chain;
-}
-
 function databaseCode(chain: Record<string, unknown>[]): string | undefined {
   return chain.map(fields => fields.code)
     .find((code): code is string => typeof code === 'string' && /^[A-Z0-9]{5}$/.test(code));
-}
-
-function isInfrastructureFailure(chain: Record<string, unknown>[]): boolean {
-  return chain.some(fields => {
-    if (typeof fields.code === 'string'
-      && (infrastructureCodes.has(fields.code) || /^(08|53)[A-Z0-9]{3}$/.test(fields.code))) return true;
-    // PostgreSQL refuses startup when a database temporarily disallows
-    // connections. Other 55000 prerequisite errors can be programming faults.
-    if (fields.code === '55000' && fields.severity === 'FATAL') return true;
-    return fields.name === 'KnexTimeoutError';
-  });
 }
 
 function parserError(exception: unknown): { status: number; body: ErrorBody } | undefined {

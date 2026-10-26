@@ -14,14 +14,16 @@ const stringFields = ['correlationId', 'messageId', 'transactionId', 'walletId',
 const numberFields = ['attempt', 'durationMs'] as const;
 
 export function log(event: string, context: LogContext = {}): void {
-  const record: Record<string, string | number> = { timestamp: new Date().toISOString(), event };
-  for (const key of stringFields) {
-    const value = context[key];
-    if (typeof value === 'string') record[key] = value;
-  }
-  for (const key of numberFields) {
-    const value = context[key];
-    if (typeof value === 'number' && Number.isFinite(value)) record[key] = value;
-  }
-  console.log(JSON.stringify(record));
+  try {
+    const record: Record<string, string | number> = { timestamp: new Date().toISOString(), event };
+    for (const key of stringFields) {
+      const value = context[key];
+      if (typeof value === 'string') record[key] = value;
+    }
+    for (const key of numberFields) {
+      const value = context[key];
+      if (typeof value === 'number' && Number.isFinite(value)) record[key] = value;
+    }
+    console.log(JSON.stringify(record));
+  } catch { /* An unavailable diagnostic sink cannot change an operation's outcome. */ }
 }

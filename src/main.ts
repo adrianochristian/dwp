@@ -8,4 +8,5 @@ if (!/^\d+$/.test(port) || BigInt(port) > 65535n) {
 
 const app = await createApplication(await createDatabase());
 await app.listen(Number(port), '0.0.0.0');
-console.log(JSON.stringify({ event: 'server_started', address: await app.getUrl() }));
+try { console.log(JSON.stringify({ event: 'server_started', address: await app.getUrl() })); }
+catch { /* A diagnostic sink failure must not terminate the listening API. */ }

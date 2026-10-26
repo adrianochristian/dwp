@@ -100,11 +100,10 @@ integration('committed financial observability without sensitive payloads', () =
       expect(records).toHaveLength(2);
       expect(records[0]).toMatchObject({ event: 'wager_transaction_error', code: 'INVALID_REQUEST' });
       expect(records[1]).toMatchObject({ event: 'wager_transaction_error', code: 'LOCK_CONFLICT' });
-      for (const record of records) {
-        expect(record).not.toHaveProperty('walletId');
-        expect(record).not.toHaveProperty('providerId');
-        expect(record).not.toHaveProperty('transactionId');
-      }
+      expect(records[0]).not.toHaveProperty('walletId');
+      expect(records[0]).not.toHaveProperty('providerId');
+      expect(records[1]).toMatchObject({ walletId: wallet.id, providerId: body.providerId });
+      for (const record of records) expect(record).not.toHaveProperty('transactionId');
       const serialized = JSON.stringify(records);
       expect(serialized).not.toContain('private');
       expect(serialized).not.toContain(key);
