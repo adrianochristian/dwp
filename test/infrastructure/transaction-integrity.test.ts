@@ -1,8 +1,9 @@
+import { createWageringQueries, createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { canonicalHash, wagerPayload, wagerRequest } from '../../dist/application/contracts.js';
-import { WageringQueries } from '../../dist/application/wagering-queries.js';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringQueries } from '../../dist/application/wagering-queries.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -21,8 +22,8 @@ integration('immutable wagering identity and terminal audit retention', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
-    queries = new WageringQueries(orm);
+    service = createWageringService(orm);
+    queries = createWageringQueries(orm);
   });
 
   afterAll(async () => {

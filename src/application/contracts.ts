@@ -1,11 +1,11 @@
-import { HttpException } from '@nestjs/common';
+import { ApplicationError } from './application-error.js';
 import { DomainError } from '../domain/domain-error.js';
 import { Money } from '../domain/money.js';
 import { createHash } from 'node:crypto';
 import { WagerTransactionKind } from '../domain/wager-transaction.js';
 
 export function invalidRequest(message: string, code = 'INVALID_REQUEST'): never {
-  throw new HttpException({ code, message }, 400);
+  throw new ApplicationError('validation', code, message);
 }
 
 export function object(value: unknown, field = 'body'): Record<string, unknown> {

@@ -1,7 +1,8 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createApplication } from '../../dist/application.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { canonicalHash, wagerPayload, wagerRequest } from '../../dist/application/contracts.js';
@@ -23,7 +24,7 @@ integration('WIN credits and optional BET references', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
     app = await createApplication(orm);
     await app.listen(0, '127.0.0.1');
     address = await app.getUrl();

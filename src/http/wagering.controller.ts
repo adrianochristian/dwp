@@ -10,8 +10,8 @@ import {
   Query,
   Res,
 } from '@nestjs/common';
-import { WageringService } from '../application/wagering-service.js';
-import { WageringQueries } from '../application/wagering-queries.js';
+import { WageringService, type WageringUseCases } from '../application/wagering-service.js';
+import { WageringQueries, type WageringReadUseCases } from '../application/wagering-queries.js';
 import { Access } from '../auth/access.decorator.js';
 
 interface StatusResponse {
@@ -22,8 +22,8 @@ interface StatusResponse {
 @Access('operator')
 export class WageringController {
   constructor(
-    @Inject(WageringService) private readonly service: WageringService,
-    @Inject(WageringQueries) private readonly queries: WageringQueries,
+    @Inject(WageringService) private readonly service: WageringUseCases,
+    @Inject(WageringQueries) private readonly queries: WageringReadUseCases,
   ) {}
 
   @Post('wallets')

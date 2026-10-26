@@ -1,3 +1,4 @@
+import { createWageringService } from './infrastructure/persistence/wagering-services.js';
 import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher.js';
 import { createSqsClient, getQueueUrl, queueNames } from './infrastructure/messaging/sqs.js';
 import { createDatabase } from './infrastructure/persistence/database.js';
@@ -99,7 +100,7 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
         process.env.COMMAND_QUEUE_URL ?? getQueueUrl(sqs, queueNames.commands, startup.signal),
         process.env.DLQ_QUEUE_URL ?? getQueueUrl(sqs, queueNames.deadLetters, startup.signal),
       ]);
-      consumer = new SqsConsumer(new ObservedWageringService(database, 'sqs'), sqs, commands, deadLetters, {
+      consumer = new SqsConsumer(new ObservedWageringService(createWageringService(database), 'sqs'), sqs, commands, deadLetters, {
         onError: () => log('consumer_cycle_failed', { code: 'INFRASTRUCTURE_UNAVAILABLE' }),
         onRetry: observation => {
           metrics.increment('retries', { role: 'consumer' });
@@ -115,7 +116,7 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
       loops.push(consumer.run());
     }
     if (role === 'reference' || role === 'all') {
-      references = new ReferenceWorker(database, new ObservedWageringService(database, 'reference'), {
+      references = new ReferenceWorker(database, new ObservedWageringService(createWageringService(database), 'reference'), {
         onRetry: id => {
           metrics.increment('retries', { role: 'reference' });
           log('reference_retry_failed', { transactionId: id, correlationId: id, code: 'INFRASTRUCTURE_UNAVAILABLE' });

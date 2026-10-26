@@ -1,3 +1,4 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, afterEach, beforeAll, beforeEach, expect } from 'bun:test';
 import {
   CreateQueueCommand,
@@ -7,7 +8,7 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { createSqsClient } from '../../dist/infrastructure/messaging/sqs.js';
 import {
@@ -35,7 +36,7 @@ export function consumerTestContext() {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.href);
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
     sqs = createSqsClient();
   });
 

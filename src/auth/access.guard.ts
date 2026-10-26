@@ -1,6 +1,6 @@
 import { ForbiddenException, Inject, Injectable, type CanActivate, type ExecutionContext } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { WageringQueries } from '../application/wagering-queries.js';
+import { WageringQueries, type WageringReadUseCases } from '../application/wagering-queries.js';
 import { ACCESS_POLICY, type AccessDefinition } from './access.decorator.js';
 import { PROVIDER_IDENTITY_PORT, type ProviderIdentity, type ProviderIdentityPort } from './provider-identity.js';
 
@@ -21,7 +21,7 @@ export class AccessGuard implements CanActivate {
   constructor(
     @Inject(PROVIDER_IDENTITY_PORT) private readonly identities: ProviderIdentityPort,
     private readonly reflector: Reflector,
-    @Inject(WageringQueries) private readonly queries: WageringQueries,
+    @Inject(WageringQueries) private readonly queries: WageringReadUseCases,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {

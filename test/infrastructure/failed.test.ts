@@ -1,6 +1,7 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -18,7 +19,7 @@ integration('permanent infrastructure failures remain auditably terminal', () =>
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {
@@ -94,7 +95,7 @@ integration('permanent infrastructure failures remain auditably terminal', () =>
 
   test('rolls back FAILED and inbox auditing atomically when the precommit hook fails', async () => {
     const { wallet, body, context, key } = await fixture();
-    const failing = new WageringService(orm, { beforeCommit: () => { throw new Error('injected-failure-audit-rollback'); } });
+    const failing = createWageringService(orm, { beforeCommit: () => { throw new Error('injected-failure-audit-rollback'); } });
     await expect(failing.failSubmission(body, key, 'RETRY_EXHAUSTED', context)).rejects.toThrow('injected-failure-audit-rollback');
     expect(await query('select id from dwp.wager_transactions where idempotency_key = ?', [key])).toHaveLength(0);
     expect(await query('select message_id from dwp.inbox_messages where consumer_name = ? and message_id = ?', [context.consumerName, context.messageId])).toHaveLength(0);
@@ -105,9 +106,9 @@ integration('permanent infrastructure failures remain auditably terminal', () =>
 
   test('does not invent a FAILED transaction for invalid contracts or invalid failure identifiers', async () => {
     const { wallet, body, context, key } = await fixture();
-    await expect(service.failSubmission({ ...body, kind: 'OPENING' }, key, 'RETRY_EXHAUSTED', context)).rejects.toMatchObject({ status: 400 });
-    await expect(service.failSubmission(body, key, 'invalid code', context)).rejects.toMatchObject({ status: 400 });
-    await expect(service.failSubmission({ ...body, money: { amount: 10, currency: 'BRL' } }, key, 'RETRY_EXHAUSTED', context)).rejects.toMatchObject({ status: 400 });
+    await expect(service.failSubmission({ ...body, kind: 'OPENING' }, key, 'RETRY_EXHAUSTED', context)).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.failSubmission(body, key, 'invalid code', context)).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.failSubmission({ ...body, money: { amount: 10, currency: 'BRL' } }, key, 'RETRY_EXHAUSTED', context)).rejects.toMatchObject({ kind: 'validation' });
     expect(await query('select id from dwp.wager_transactions where idempotency_key = ?', [key])).toHaveLength(0);
     expect(await query('select message_id from dwp.inbox_messages where consumer_name = ? and message_id = ?', [context.consumerName, context.messageId])).toHaveLength(0);
     await assertConsistent(wallet.id);

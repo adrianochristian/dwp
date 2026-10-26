@@ -1,3 +1,4 @@
+import { createWageringService, createWageringQueries } from './infrastructure/persistence/wagering-services.js';
 import { Module, type DynamicModule } from '@nestjs/common';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { WageringService } from './application/wagering-service.js';
@@ -20,8 +21,8 @@ export class AppModule {
       module: AppModule,
       controllers: [WageringController, OperationalController],
       providers: [
-        { provide: WageringService, useValue: new ObservedWageringService(database, 'http') },
-        { provide: WageringQueries, useValue: new ObservedWageringQueries(database) },
+        { provide: WageringService, useValue: new ObservedWageringService(createWageringService(database), 'http') },
+        { provide: WageringQueries, useValue: new ObservedWageringQueries(createWageringQueries(database)) },
         { provide: 'Database', useValue: database },
         { provide: 'SqsClient', useValue: sqs },
         { provide: PROVIDER_IDENTITY_PORT, useValue: createIdentityPort() },

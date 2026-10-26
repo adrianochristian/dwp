@@ -1,3 +1,4 @@
+import { ApplicationError } from '../../application/application-error.js';
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
@@ -125,6 +126,7 @@ function failureCode(error: unknown, fallback: string): string {
 }
 
 function isPermanent(error: unknown): boolean {
+  if (error instanceof ApplicationError) return error.kind !== 'unavailable';
   if (error instanceof InvalidCommandEnvelope) return true;
   const status = statusCode(error);
   return status !== undefined && status >= 400 && status < 500 && ![408, 422, 425, 429].includes(status);

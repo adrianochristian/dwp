@@ -1,6 +1,7 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -18,7 +19,7 @@ integration('ROLLBACK inverts a processed financial transaction', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {
@@ -279,7 +280,7 @@ integration('ROLLBACK inverts a processed financial transaction', () => {
       expect(await ledgerDirection(rejected.transactionId)).toBeUndefined();
     }
     const { referenceExternalTransactionId: _reference, ...missing } = command('ROLLBACK', '1.00', bet.externalTransactionId);
-    await expect(service.submit(missing, crypto.randomUUID())).rejects.toMatchObject({ status: 400 });
+    await expect(service.submit(missing, crypto.randomUUID())).rejects.toMatchObject({ kind: 'validation' });
     await assertConsistent(wallet.id);
   });
 });

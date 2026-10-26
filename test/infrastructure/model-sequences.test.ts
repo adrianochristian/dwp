@@ -1,8 +1,9 @@
+import { createWageringService } from '../../src/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, test } from 'bun:test';
 import assert from 'node:assert/strict';
 import fc from 'fast-check';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../src/application/wagering-service.js';
+import type { WageringService } from '../../src/application/wagering-service.js';
 import { createDatabase } from '../../src/infrastructure/persistence/database.js';
 import {
   WageringOracle, decimal, expectedBusinessHash, expectedInboxHash,
@@ -148,9 +149,8 @@ function buildRequest(step: Step, state: OracleState, namespace: string, index: 
 
 function conflictCode(error: unknown): string | undefined {
   if (error === null || typeof error !== 'object') return undefined;
-  const fields = error as { kind?: string; code?: string; status?: number; response?: { code?: string } };
-  if (fields.kind === 'conflict') return fields.code;
-  return fields.status === 409 ? fields.response?.code : undefined;
+  const fields = error as { kind?: string; code?: string };
+  return fields.kind === 'conflict' ? fields.code : undefined;
 }
 
 function renderResult(result: OracleResult, bindings: Map<string, string>): ActualResult {
@@ -190,7 +190,7 @@ integration('independent integer-ledger model over generated SQL sequences', () 
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {

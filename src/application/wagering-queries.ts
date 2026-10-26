@@ -1,40 +1,7 @@
-import { HttpException } from '@nestjs/common';
-import type { MikroORM } from '@mikro-orm/postgresql';
-import { Money, type MoneyProps } from '../domain/money.js';
+import { ApplicationError } from './application-error.js';
+import type { MoneyProps } from '../domain/money.js';
+import type { TransactionView, WageringReadPort } from './ports/wagering-store.js';
 import { invalidRequest, object, text, uuid } from './contracts.js';
-
-interface TransactionRow {
-  id: string;
-  provider_id: string;
-  external_transaction_id: string;
-  wallet_id: string;
-  player_id: string;
-  round_id: string;
-  game_id: string;
-  kind: string;
-  amount_cents: string;
-  currency: string;
-  reference_external_transaction_id: string | null;
-  reference_transaction_id: string | null;
-  status: string;
-  failure_code: string | null;
-  result: Record<string, unknown> | null;
-  created_at: string | Date;
-  processed_at: string | Date | null;
-}
-
-interface LedgerRow {
-  id: string;
-  wallet_id: string;
-  transaction_id: string;
-  direction: string;
-  amount_cents: string;
-  currency: string;
-  balance_before_cents: string;
-  balance_after_cents: string;
-  wallet_version: number;
-  created_at: string | Date;
-}
 
 interface LedgerCursor {
   v: 1;
@@ -53,14 +20,6 @@ export interface LedgerEntryResponse {
   balanceAfter: MoneyProps;
   walletVersion: number;
   createdAt: string;
-}
-
-const transactionColumns = `id, provider_id, external_transaction_id, wallet_id, player_id,
-  round_id, game_id, kind, amount_cents::text, currency, reference_external_transaction_id,
-  reference_transaction_id, status, failure_code, result, created_at, processed_at`;
-
-function serializedMoney(cents: string, currency: string): MoneyProps {
-  return Money.fromMinorUnits(BigInt(cents), currency).toJSON();
 }
 
 function encodeCursor(cursor: LedgerCursor): string {
@@ -100,127 +59,74 @@ function pageLimit(value: unknown): number {
 }
 
 export class WageringQueries {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(private readonly store: WageringReadPort) {}
 
   async getTransaction(id: string) {
-    const transactionId = uuid(id, 'transactionId');
-    const rows = await this.orm.em.fork().execute<TransactionRow[]>(
-      `select ${transactionColumns} from dwp.wager_transactions where id = ?`, [transactionId],
-    );
-    return this.transactionResponse(rows[0]);
+    return this.transactionResponse(await this.store.findTransaction(uuid(id, 'transactionId')));
   }
 
   async getExternalTransaction(providerId: string, externalTransactionId: string) {
-    const provider = text(providerId, 'providerId');
-    const external = text(externalTransactionId, 'externalTransactionId');
-    const rows = await this.orm.em.fork().execute<TransactionRow[]>(
-      `select ${transactionColumns} from dwp.wager_transactions
-       where provider_id = ? and external_transaction_id = ?`, [provider, external],
-    );
-    return this.transactionResponse(rows[0]);
+    return this.transactionResponse(await this.store.findExternalTransaction(
+      text(providerId, 'providerId'), text(externalTransactionId, 'externalTransactionId'),
+    ));
   }
 
   async ledger(id: string, cursorValue: unknown = undefined, limitValue: unknown = undefined) {
     const walletId = uuid(id, 'walletId');
     const limit = pageLimit(limitValue);
     const cursor = decodeCursor(cursorValue, walletId);
-    const em = this.orm.em.fork();
-    const wallets = await em.execute<{ id: string; ceiling_version: number }[]>(`
-      select w.id, coalesce((select max(l.wallet_version)
-        from dwp.wallet_ledger_entries l where l.wallet_id = w.id), 0)::integer as ceiling_version
-      from dwp.wallets w where w.id = ?`, [walletId]);
-    if (!wallets[0]) {
-      throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+    const currentCeiling = await this.store.ledgerCeiling(walletId);
+    if (currentCeiling === undefined) {
+      throw new ApplicationError('not_found', 'WALLET_NOT_FOUND', 'The wallet does not exist');
     }
-    const ceilingVersion = cursor?.ceilingVersion ?? wallets[0].ceiling_version;
-    if (ceilingVersion > wallets[0].ceiling_version) {
+    const ceilingVersion = cursor?.ceilingVersion ?? currentCeiling;
+    if (ceilingVersion > currentCeiling) {
       invalidRequest('The ledger cursor exceeds the wallet history', 'INVALID_CURSOR');
     }
-    const rows = await em.execute<LedgerRow[]>(`
-      select id, wallet_id, transaction_id, direction, amount_cents::text, currency,
-        balance_before_cents::text, balance_after_cents::text, wallet_version, created_at
-      from dwp.wallet_ledger_entries
-      where wallet_id = ? and wallet_version > ? and wallet_version <= ?
-      order by wallet_version asc limit ?`, [walletId, cursor?.lastVersion ?? 0, ceilingVersion, limit + 1]);
+    const rows = await this.store.ledgerPage(walletId, cursor?.lastVersion ?? 0, ceilingVersion, limit + 1);
     const page = rows.slice(0, limit);
-    const entries: LedgerEntryResponse[] = page.map(row => ({
-      id: row.id,
-      walletId: row.wallet_id,
-      transactionId: row.transaction_id,
-      direction: row.direction,
-      money: serializedMoney(row.amount_cents, row.currency),
-      balanceBefore: serializedMoney(row.balance_before_cents, row.currency),
-      balanceAfter: serializedMoney(row.balance_after_cents, row.currency),
-      walletVersion: row.wallet_version,
-      createdAt: new Date(row.created_at).toISOString(),
+    const entries: LedgerEntryResponse[] = page.map(entry => ({
+      id: entry.id, walletId: entry.walletId, transactionId: entry.transactionId, direction: entry.direction,
+      money: entry.money.toJSON(), balanceBefore: entry.balanceBefore.toJSON(), balanceAfter: entry.balanceAfter.toJSON(),
+      walletVersion: entry.walletVersion, createdAt: entry.createdAt.toISOString(),
     }));
     const last = page.at(-1);
     const nextCursor = rows.length > limit && last
-      ? encodeCursor({ v: 1, walletId, lastVersion: last.wallet_version, ceilingVersion })
+      ? encodeCursor({ v: 1, walletId, lastVersion: last.walletVersion, ceilingVersion })
       : null;
     return { walletId, entries, nextCursor };
   }
 
   async reconcile(id: string) {
     const walletId = uuid(id, 'walletId');
-    // PostgreSQL gives the entire statement one snapshot, including both the
-    // materialized balance and the aggregate over immutable ledger entries.
-    const rows = await this.orm.em.fork().execute<{
-      currency: string;
-      stored_balance_cents: string;
-      calculated_balance_cents: string;
-      checked_entries: number;
-    }[]>(`
-      select w.currency, w.balance_cents::text as stored_balance_cents,
-        coalesce(sum(case when l.direction = 'CREDIT'
-          then l.amount_cents::numeric else -l.amount_cents::numeric end), 0)::text as calculated_balance_cents,
-        count(l.id)::integer as checked_entries
-      from dwp.wallets w left join dwp.wallet_ledger_entries l on l.wallet_id = w.id
-      where w.id = ? group by w.id`, [walletId]);
-    const row = rows[0];
-    if (!row) {
-      throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
-    }
-    const stored = Money.fromMinorUnits(BigInt(row.stored_balance_cents), row.currency);
-    const calculated = Money.fromMinorUnits(BigInt(row.calculated_balance_cents), row.currency);
-    const difference = stored.subtract(calculated);
+    const snapshot = await this.store.reconciliationSnapshot(walletId);
+    if (!snapshot) throw new ApplicationError('not_found', 'WALLET_NOT_FOUND', 'The wallet does not exist');
+    const difference = snapshot.storedBalance.subtract(snapshot.calculatedBalance);
     const consistent = difference.isZero();
-    if (!consistent) {
-      console.error(JSON.stringify({ event: 'wallet_reconciliation_inconsistent', walletId }));
-    }
+    if (!consistent) console.error(JSON.stringify({ event: 'wallet_reconciliation_inconsistent', walletId }));
     return {
-      walletId,
-      storedBalance: stored.toJSON(),
-      calculatedBalance: calculated.toJSON(),
-      difference: difference.toJSON(),
-      consistent,
-      checkedEntries: row.checked_entries,
+      walletId, storedBalance: snapshot.storedBalance.toJSON(), calculatedBalance: snapshot.calculatedBalance.toJSON(),
+      difference: difference.toJSON(), consistent, checkedEntries: snapshot.checkedEntries,
     };
   }
 
-  private transactionResponse(row: TransactionRow | undefined) {
-    if (!row) {
-      throw new HttpException({ code: 'TRANSACTION_NOT_FOUND', message: 'The transaction does not exist' }, 404);
-    }
+  private transactionResponse(transaction: TransactionView | undefined) {
+    if (!transaction) throw new ApplicationError('not_found', 'TRANSACTION_NOT_FOUND', 'The transaction does not exist');
     return {
-      ...row.result,
-      transactionId: row.id,
-      providerId: row.provider_id,
-      externalTransactionId: row.external_transaction_id,
-      walletId: row.wallet_id,
-      playerId: row.player_id,
-      roundId: row.round_id,
-      gameId: row.game_id,
-      kind: row.kind,
-      money: serializedMoney(row.amount_cents, row.currency),
-      status: row.status,
-      ...(row.reference_external_transaction_id === null ? {} : {
-        referenceExternalTransactionId: row.reference_external_transaction_id,
+      ...transaction.result,
+      transactionId: transaction.id, providerId: transaction.providerId,
+      externalTransactionId: transaction.externalTransactionId, walletId: transaction.walletId,
+      playerId: transaction.playerId, roundId: transaction.roundId, gameId: transaction.gameId,
+      kind: transaction.kind, money: transaction.money.toJSON(), status: transaction.status,
+      ...(transaction.referenceExternalTransactionId === undefined ? {} : {
+        referenceExternalTransactionId: transaction.referenceExternalTransactionId,
       }),
-      ...(row.reference_transaction_id === null ? {} : { referenceTransactionId: row.reference_transaction_id }),
-      ...(row.failure_code === null ? {} : { failureCode: row.failure_code }),
-      createdAt: new Date(row.created_at).toISOString(),
-      ...(row.processed_at === null ? {} : { processedAt: new Date(row.processed_at).toISOString() }),
+      ...(transaction.referenceTransactionId === undefined ? {} : { referenceTransactionId: transaction.referenceTransactionId }),
+      ...(transaction.failureCode === undefined ? {} : { failureCode: transaction.failureCode }),
+      createdAt: transaction.createdAt.toISOString(),
+      ...(transaction.processedAt === undefined ? {} : { processedAt: transaction.processedAt.toISOString() }),
     };
   }
 }
+
+export type WageringReadUseCases = Pick<WageringQueries, 'getTransaction' | 'getExternalTransaction' | 'ledger' | 'reconcile'>;

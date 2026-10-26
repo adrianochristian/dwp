@@ -4,7 +4,7 @@ import { text, wagerRequest, walletRequest } from '../../src/application/contrac
 function expectInvalidRequest(operation: () => unknown): void {
   let caught: unknown;
   try { operation(); } catch (error) { caught = error; }
-  expect(caught).toMatchObject({ status: 400, response: { code: 'INVALID_REQUEST' } });
+  expect(caught).toMatchObject({ kind: 'validation', code: 'INVALID_REQUEST' });
 }
 
 describe('Unicode identity contracts', () => {

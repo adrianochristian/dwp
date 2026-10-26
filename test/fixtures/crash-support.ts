@@ -1,3 +1,4 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import {
   CreateQueueCommand,
   DeleteMessageBatchCommand,
@@ -6,7 +7,6 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { createSqsClient } from '../../dist/infrastructure/messaging/sqs.js';
 
@@ -128,7 +128,7 @@ export async function receiveEvents(sqs: SQSClient, queueUrl: string, acknowledg
 }
 
 export async function createFinancialEvent(environment: CrashEnvironment): Promise<{ eventId: string; walletId: string }> {
-  const service = new WageringService(environment.orm);
+  const service = createWageringService(environment.orm);
   const wallet = await service.createWallet({
     playerId: crypto.randomUUID(), initialBalance: { amount: '100.00', currency: 'BRL' },
   });

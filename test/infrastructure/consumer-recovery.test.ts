@@ -1,6 +1,6 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { describe, expect, test } from 'bun:test';
 import { ChangeMessageVisibilityCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
-import { WageringService } from '../../dist/application/wagering-service.js';
 import type { WagerCommandHandler } from '../../dist/infrastructure/messaging/sqs-consumer.js';
 import { consumerTestContext } from './consumer-support.js';
 
@@ -25,10 +25,45 @@ integration('SQS command retry, DLQ and controlled shutdown', () => {
     expect(deadLetters[0]!.MessageAttributes?.sourceMessageId?.StringValue).toBeString();
   });
 
+  test('dead-letters application validation errors immediately without retrying the financial command', async () => {
+    const { wallet, envelope } = await fixture();
+    envelope.data.kind = 'OPENING';
+    const worker = consumer();
+    await send(envelope);
+    expect(await worker.runOnce()).toBe(1);
+    expect(await receive()).toHaveLength(0);
+    const deadLetters = await receive(context.dlqUrl);
+    expect(deadLetters).toHaveLength(1);
+    expect(deadLetters[0]!.MessageAttributes?.failureCode?.StringValue).toBe('INVALID_TRANSACTION_KIND');
+    expect(await query('select id from dwp.wager_transactions where idempotency_key = ?', [envelope.data.idempotencyKey])).toHaveLength(0);
+    await assertConsistent(wallet.id, '10000', 0);
+  });
+
+  test('dead-letters a conflicting application inbox identity immediately while preserving the original result', async () => {
+    const { wallet, envelope } = await fixture();
+    const worker = consumer();
+    await send(envelope);
+    expect(await worker.runOnce()).toBe(1);
+    const changed = {
+      ...envelope,
+      data: { ...envelope.data, externalTransactionId: crypto.randomUUID(), idempotencyKey: crypto.randomUUID() },
+    };
+    await send(changed);
+    expect(await worker.runOnce()).toBe(1);
+    expect(await receive()).toHaveLength(0);
+    const deadLetters = await receive(context.dlqUrl);
+    expect(deadLetters).toHaveLength(1);
+    expect(deadLetters[0]!.MessageAttributes?.failureCode?.StringValue).toBe('INBOX_MESSAGE_CONFLICT');
+    expect(await query('select id from dwp.wager_transactions where idempotency_key = ?', [changed.data.idempotencyKey])).toHaveLength(0);
+    expect(await query('select message_id from dwp.inbox_messages where consumer_name = ? and message_id = ?',
+      [consumerName, envelope.messageId])).toHaveLength(1);
+    await assertConsistent(wallet.id, '9000', 1);
+  });
+
   test('rolls back a precommit failure on every attempt and dead-letters after the configured limit', async () => {
     const { wallet, envelope } = await fixture();
     let attempts = 0;
-    const failingService = new WageringService(context.orm, { beforeCommit: () => {
+    const failingService = createWageringService(context.orm, { beforeCommit: () => {
       attempts += 1;
       throw new Error('injected consumer transaction rollback');
     } });
@@ -60,7 +95,7 @@ integration('SQS command retry, DLQ and controlled shutdown', () => {
   test('audits exhausted retries as FAILED with inbox and one failure event before sending the original command to DLQ', async () => {
     const { wallet, envelope } = await fixture();
     let attempts = 0;
-    const failingService = new WageringService(context.orm, { beforeCommit: () => {
+    const failingService = createWageringService(context.orm, { beforeCommit: () => {
       attempts += 1;
       throw new Error('injected financial commit failure');
     } });
@@ -106,7 +141,7 @@ integration('SQS command retry, DLQ and controlled shutdown', () => {
     const { wallet, envelope } = await fixture();
     let submitCalls = 0;
     let failedSend = false;
-    const failingService = new WageringService(context.orm, { beforeCommit: () => {
+    const failingService = createWageringService(context.orm, { beforeCommit: () => {
       throw new Error('injected financial commit failure before failed audit');
     } });
     const handler: WagerCommandHandler = {

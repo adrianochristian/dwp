@@ -1,8 +1,9 @@
+import { createWageringQueries, createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { ReferenceWorker } from '../../dist/application/reference-worker.js';
-import { WageringService } from '../../dist/application/wagering-service.js';
-import { WageringQueries } from '../../dist/application/wagering-queries.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringQueries } from '../../dist/application/wagering-queries.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { canonicalHash, wagerPayload, wagerRequest } from '../../dist/application/contracts.js';
 import { WagerTransaction, WagerTransactionStatus } from '../../dist/domain/wager-transaction.js';
@@ -24,8 +25,8 @@ integration('durable out-of-order reference processing', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
-    queries = new WageringQueries(orm);
+    service = createWageringService(orm);
+    queries = createWageringQueries(orm);
   });
 
   afterEach(async () => {
@@ -124,7 +125,7 @@ integration('durable out-of-order reference processing', () => {
       await oldWorker.stop();
       await service.submit(bet, crypto.randomUUID());
       await makeDue(pending.transactionId);
-      const restarted = new ReferenceWorker(orm, new WageringService(orm));
+      const restarted = new ReferenceWorker(orm, createWageringService(orm));
       expect(await restarted.runOnce()).toBe(1);
       await restarted.stop();
       expect(await queries.getTransaction(pending.transactionId)).toMatchObject({
@@ -233,7 +234,7 @@ integration('durable out-of-order reference processing', () => {
     expect(pendingRollback.status).toBe('PENDING_REFERENCE');
     await service.submit(bet, crypto.randomUUID());
     await Promise.all([makeDue(pendingRefund.transactionId), makeDue(pendingRollback.transactionId)]);
-    const worker = new ReferenceWorker(orm, new WageringService(orm));
+    const worker = new ReferenceWorker(orm, createWageringService(orm));
     try {
       await Promise.all([worker.runOnce(), service.submit(refund, refundKey)]);
     } finally {

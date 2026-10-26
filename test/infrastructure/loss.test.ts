@@ -1,7 +1,8 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { INestApplication } from '@nestjs/common';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createApplication } from '../../dist/application.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
@@ -22,7 +23,7 @@ integration('LOSS records a result without moving balance', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
     app = await createApplication(orm);
     await app.listen(0, '127.0.0.1');
     address = await app.getUrl();
@@ -118,7 +119,7 @@ integration('LOSS records a result without moving balance', () => {
     const rejected = await service.submit({ ...loss, referenceExternalTransactionId: reference, roundId: 'other-round' }, key);
     expect(rejected).toMatchObject({ status: 'REJECTED', failureCode: 'REFERENCE_MISMATCH' });
     expect(await query('select id from dwp.wallet_ledger_entries where transaction_id = ?', [rejected.transactionId])).toHaveLength(0);
-    await expect(service.submit({ ...loss, money: { amount: '-0.01', currency: 'BRL' } }, crypto.randomUUID())).rejects.toMatchObject({ status: 400 });
+    await expect(service.submit({ ...loss, money: { amount: '-0.01', currency: 'BRL' } }, crypto.randomUUID())).rejects.toMatchObject({ kind: 'validation' });
     await assertConsistent(wallet.id);
   });
 

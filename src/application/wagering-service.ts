@@ -1,98 +1,34 @@
-import { HttpException } from '@nestjs/common';
-import { ForeignKeyConstraintViolationException, UniqueConstraintViolationException } from '@mikro-orm/core';
-import type { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 import { createHash } from 'node:crypto';
-import { WalletBalanceChanged, WagerTransactionFailed, WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected, type IntegrationEvent } from '../domain/integration-event.js';
+import { ApplicationError } from './application-error.js';
+import { WalletBalanceChanged, WagerTransactionFailed, WagerTransactionPendingReference, WagerTransactionProcessed, WagerTransactionRejected } from '../domain/integration-event.js';
 import { DomainError } from '../domain/domain-error.js';
-import { InboxMessage } from '../domain/inbox-message.js';
+import type { InboxMessage } from '../domain/inbox-message.js';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/ledger-entry.js';
-import { Money, type MoneyProps } from '../domain/money.js';
+import { Money } from '../domain/money.js';
 import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../domain/wager-transaction.js';
 import { Wallet, type WalletMovement } from '../domain/wallet.js';
-import { WalletRecord } from '../infrastructure/persistence/records.js';
 import { canonicalHash, invalidRequest, text, uuid, wagerPayload, wagerRequest, walletRequest } from './contracts.js';
+import type { InboxContext, InboxIdentity, ReceivedInbox, StoredWager, SubmissionResult, WageringStorePort, WageringTransactionPort } from './ports/wagering-store.js';
 
-export interface WageringServiceOptions {
-  /** Runs inside the transaction, before commit; useful for fault injection. */
-  beforeCommit?: () => Promise<void> | void;
-}
-
-export interface SubmissionResult {
-  transactionId: string;
-  status: `${WagerTransactionStatus}`;
-  balance: MoneyProps;
-  idempotentReplay: boolean;
-  failureCode?: string;
-}
-
-export interface InboxContext {
-  consumerName: string;
-  messageId: string;
-}
-
-interface InboxRow {
-  consumer_name: string;
-  message_id: string;
-  payload_hash: string;
-  received_at: string;
-  processed_at: string | null;
-  result: SubmissionResult | null;
-}
-
-interface TransactionRow {
-  id: string;
-  provider_id: string;
-  external_transaction_id: string;
-  idempotency_key: string;
-  payload_hash: string;
-  wallet_id: string;
-  player_id: string;
-  round_id: string;
-  game_id: string;
-  kind: WagerTransactionKind;
-  amount_cents: string;
-  currency: string;
-  reference_external_transaction_id: string | null;
-  reference_transaction_id: string | null;
-  status: WagerTransactionStatus;
-  failure_code: string | null;
-  result: SubmissionResult | null;
-  retry_count: number;
-  next_attempt_at: string;
-  created_at: string;
-  processed_at: string | null;
-}
+export type { InboxContext, SubmissionResult, WageringStoreOptions as WageringServiceOptions } from './ports/wagering-store.js';
 
 export class WageringService {
-  constructor(private readonly orm: MikroORM, private readonly options: WageringServiceOptions = {}) {}
+  constructor(private readonly store: WageringStorePort) {}
 
   async createWallet(body: unknown) {
     const input = walletRequest(body);
     const wallet = Wallet.open({ id: crypto.randomUUID(), ...input });
-    try {
-      return await this.orm.em.fork().transactional(async em => {
-        await em.execute(`insert into dwp.wallets
-          (id, player_id, currency, balance_cents, version, created_at, updated_at)
-          values (?, ?, ?, ?, ?, ?, ?)`, [
-          wallet.id, wallet.playerId, wallet.currency, wallet.balance.cents.toString(),
-          wallet.version, wallet.createdAt, wallet.updatedAt,
-        ]);
-        if (wallet.balance.isPositive()) await this.opening(em, wallet);
-        await this.options.beforeCommit?.();
-        return this.walletResponse(wallet);
-      });
-    } catch (error) {
-      if (error instanceof UniqueConstraintViolationException) {
-        throw new HttpException({ code: 'WALLET_ALREADY_EXISTS', message: 'A wallet already exists for this player and currency' }, 409);
-      }
-      throw error;
-    }
+    return this.store.transaction(async transaction => {
+      await transaction.insertWallet(wallet);
+      if (wallet.balance.isPositive()) await this.opening(transaction, wallet);
+      return this.walletResponse(wallet);
+    });
   }
 
   async getWallet(id: string) {
-    const record = await this.orm.em.fork().findOne(WalletRecord, { id: uuid(id, 'walletId') });
-    if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
-    return this.walletResponse(this.walletFromRecord(record));
+    const wallet = await this.store.readWallet(uuid(id, 'walletId'));
+    if (!wallet) throw new ApplicationError('not_found', 'WALLET_NOT_FOUND', 'The wallet does not exist');
+    return this.walletResponse(wallet);
   }
 
   async submit(body: unknown, idempotencyKey: unknown, inboxContext?: InboxContext): Promise<SubmissionResult> {
@@ -105,76 +41,40 @@ export class WageringService {
       payloadHash: canonicalHash({ idempotencyKey: key, ...wagerPayload(input) }),
     };
     const proposed = WagerTransaction.create({ ...input, id: crypto.randomUUID(), idempotencyKey: key, payloadHash });
-    try {
-      return await this.orm.em.fork().transactional(async em => {
-        const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(em, inboxIdentity);
-        if (inbox?.message.isProcessed()) {
-          if (!inbox.result) throw new Error('A processed inbox message must have a persisted response');
-          return this.completeSubmission(em, inbox.message, { ...inbox.result, idempotentReplay: true });
-        }
-        await em.execute(`insert into dwp.wager_transactions
-          (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
-           wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
-           reference_external_transaction_id, status)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') on conflict do nothing`, [
-          proposed.id, input.providerId, input.externalTransactionId, key, payloadHash,
-          input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
-          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null,
-        ]);
-        // A duplicate blocks on the unique index before acquiring the same row lock.
-        // Every entry point takes this transaction lock before the wallet lock.
-        const row = (await em.execute<TransactionRow[]>(
-          'select * from dwp.wager_transactions where idempotency_key = ? for update', [key],
-        ))[0];
-        if (!row) throw new HttpException({ code: 'EXTERNAL_IDENTITY_CONFLICT', message: 'This provider transaction already uses another idempotency key' }, 409);
-        if (row.payload_hash !== payloadHash) {
-          throw new HttpException({ code: 'IDEMPOTENCY_CONFLICT', message: 'This idempotency key was used for a different business payload' }, 409);
-        }
-        return this.processTransaction(em, row, inbox?.message);
-      });
-    } catch (error) {
-      if (error instanceof ForeignKeyConstraintViolationException) {
-        throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+    return this.store.transaction(async transaction => {
+      const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(transaction, inboxIdentity);
+      if (inbox?.message.isProcessed()) {
+        if (!inbox.result) throw new ApplicationError('internal', 'INTERNAL_ERROR', 'A processed inbox message must have a persisted response');
+        return this.completeSubmission(transaction, inbox.message, { ...inbox.result, idempotentReplay: true });
       }
-      throw error;
-    }
+      const stored = await transaction.acceptTransaction(proposed);
+      this.assertAcceptedIdentity(stored, payloadHash);
+      return this.processTransaction(transaction, stored, inbox?.message);
+    });
   }
 
   async reprocess(id: string): Promise<SubmissionResult | undefined> {
     const transactionId = uuid(id, 'transactionId');
-    return this.orm.em.fork().transactional(async em => {
-      const row = (await em.execute<TransactionRow[]>(
-        'select * from dwp.wager_transactions where id = ? for update', [transactionId],
-      ))[0];
-      if (!row || row.status !== WagerTransactionStatus.PendingReference) return undefined;
-      // Selection by another worker is advisory; only the locked row decides
-      // whether a retry is still due after another process has completed it.
-      const now = await this.databaseNow(em);
-      if (new Date(row.next_attempt_at).getTime() > now.getTime()) return undefined;
-      return this.processTransaction(em, row);
+    return this.store.transaction(async transaction => {
+      const stored = await transaction.lockTransaction(transactionId);
+      if (!stored || stored.transaction.status !== WagerTransactionStatus.PendingReference) return undefined;
+      const now = await transaction.now();
+      if (stored.nextAttemptAt.getTime() > now.getTime()) return undefined;
+      return this.processTransaction(transaction, stored);
     });
   }
 
-  private async databaseNow(em: EntityManager): Promise<Date> {
-    const row = (await em.execute<{ now: string }[]>('select clock_timestamp() as now'))[0];
-    if (!row) throw new Error('The database clock must return a timestamp');
-    return new Date(row.now);
-  }
-
-  private async processTransaction(em: EntityManager, row: TransactionRow, inbox?: InboxMessage): Promise<SubmissionResult> {
-    const transaction = this.transactionFromRow(row);
+  private async processTransaction(store: WageringTransactionPort, stored: StoredWager, inbox?: InboxMessage): Promise<SubmissionResult> {
+    const transaction = stored.transaction;
+    const previousStatus = transaction.status;
     if (transaction.isTerminal()) {
-      if (!row.result) throw new Error('A terminal transaction must have a persisted response');
-      return this.completeSubmission(em, inbox, { ...row.result, idempotentReplay: true });
+      if (!stored.result) throw new ApplicationError('internal', 'INTERNAL_ERROR', 'A terminal transaction must have a persisted response');
+      return this.completeSubmission(store, inbox, { ...stored.result, idempotentReplay: true });
     }
 
-    // Foreign-key inserts hold KEY SHARE. NO KEY UPDATE serializes balance
-    // writes while remaining compatible with those locks on other requests.
-    await em.execute('select id from dwp.wallets where id = ? for no key update', [row.wallet_id]);
-    const record = await em.findOne(WalletRecord, { id: row.wallet_id });
-    if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
-    const wallet = this.walletFromRecord(record);
-    const at = await this.databaseNow(em);
+    const wallet = await store.lockWallet(transaction.walletId);
+    if (!wallet) throw new ApplicationError('not_found', 'WALLET_NOT_FOUND', 'The wallet does not exist');
+    const at = await store.now();
     let movement: WalletMovement | undefined;
     let reference: WagerTransaction | undefined;
     let referencePending = false;
@@ -185,10 +85,8 @@ export class WageringService {
         if (at.getTime() - transaction.createdAt.getTime() >= 24 * 60 * 60 * 1_000) {
           throw new DomainError('REFERENCE_EXPIRED', 'The reference did not resolve within twenty-four hours');
         }
-        const referenceRow = (await em.execute<TransactionRow[]>(`select * from dwp.wager_transactions
-          where provider_id = ? and external_transaction_id = ?`, [transaction.providerId, transaction.referenceExternalTransactionId]))[0];
-        if (referenceRow) {
-          reference = this.transactionFromRow(referenceRow);
+        reference = await store.findReference(transaction.providerId, transaction.referenceExternalTransactionId);
+        if (reference) {
           try {
             transaction.validateReference(reference);
           } catch (error) {
@@ -205,9 +103,8 @@ export class WageringService {
         transaction.markProcessed(reference?.id, at);
       } else {
         if (transaction.requiresReference() && reference) {
-          const existing = await em.execute<{ id: string }[]>(`select id from dwp.wager_transactions
-            where reference_transaction_id = ? and kind in ('REFUND','ROLLBACK') and status = 'PROCESSED' limit 1`, [reference.id]);
-          if (existing.length > 0) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference already has a processed reversal');
+          const existing = await store.hasSuccessfulReversal(reference.id);
+          if (existing) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference already has a processed reversal');
         }
         movement = transaction.ledgerDirectionFor(reference) === LedgerDirection.Debit
           ? wallet.debit(transaction.money, at)
@@ -228,40 +125,33 @@ export class WageringService {
     const context = { correlationId: transaction.id, occurredAt: at };
     if (movement) {
       transaction.markProcessed(reference?.id, at);
-      record.balanceCents = wallet.balance.cents;
-      record.version = wallet.version;
-      record.updatedAt = wallet.updatedAt;
-      await em.flush();
+      await store.saveWallet(wallet);
       const entry = WalletLedgerEntry.create({
         id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
         direction: transaction.ledgerDirectionFor(reference), money: transaction.money,
         ...movement, createdAt: at,
       });
-      await this.insertLedger(em, entry);
-      await this.enqueue(em, WalletBalanceChanged.from(wallet, entry, context));
-      await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
+      await store.appendLedger(entry);
+      await store.enqueue(WalletBalanceChanged.from(wallet, entry, context));
+      await store.enqueue(WagerTransactionProcessed.from(transaction, context));
     } else if (referencePending) {
-      if (row.status !== WagerTransactionStatus.PendingReference) {
-        await this.enqueue(em, WagerTransactionPendingReference.from(transaction, context));
+      if (previousStatus !== WagerTransactionStatus.PendingReference) {
+        await store.enqueue(WagerTransactionPendingReference.from(transaction, context));
       }
     } else if (transaction.status === WagerTransactionStatus.Processed) {
-      await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
+      await store.enqueue(WagerTransactionProcessed.from(transaction, context));
     } else {
-      await this.enqueue(em, WagerTransactionRejected.from(transaction, context));
+      await store.enqueue(WagerTransactionRejected.from(transaction, context));
     }
     const result: SubmissionResult = {
       transactionId: transaction.id, status: transaction.status,
       balance: wallet.balance.toJSON(), idempotentReplay: false,
       ...(transaction.failureCode === undefined ? {} : { failureCode: transaction.failureCode }),
     };
-    const retries = row.retry_count + (referencePending ? 1 : 0);
-    const nextAttempt = new Date(at.getTime() + Math.min(60, 2 ** Math.min(row.retry_count, 6)) * 1_000);
-    await em.execute(`update dwp.wager_transactions set status = ?, failure_code = ?,
-      result = ?::jsonb, processed_at = ?, reference_transaction_id = ?, retry_count = ?, next_attempt_at = ? where id = ?`, [
-      transaction.status, transaction.failureCode ?? null, JSON.stringify(result), transaction.processedAt ?? null,
-      transaction.referenceTransactionId ?? null, retries, nextAttempt, transaction.id,
-    ]);
-    return this.completeSubmission(em, inbox, result);
+    const retries = stored.retryCount + (referencePending ? 1 : 0);
+    const nextAttempt = new Date(at.getTime() + Math.min(60, 2 ** Math.min(stored.retryCount, 6)) * 1_000);
+    await store.saveTransaction(transaction, result, { count: retries, nextAttemptAt: nextAttempt });
+    return this.completeSubmission(store, inbox, result);
   }
 
   async failSubmission(body: unknown, idempotencyKey: unknown, failureCode: string, inboxContext?: InboxContext): Promise<SubmissionResult> {
@@ -276,118 +166,60 @@ export class WageringService {
       messageId: text(inboxContext.messageId, 'messageId'),
       payloadHash: canonicalHash({ idempotencyKey: key, ...wagerPayload(input) }),
     };
-    try {
-      return await this.orm.em.fork().transactional(async em => {
-        const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(em, inboxIdentity);
-        if (inbox?.message.isProcessed()) {
-          if (!inbox.result) throw new Error('A processed inbox message must have a persisted response');
-          return this.completeSubmission(em, inbox.message, { ...inbox.result, idempotentReplay: true });
-        }
-        await em.execute(`insert into dwp.wager_transactions
-          (id, provider_id, external_transaction_id, idempotency_key, payload_hash,
-           wallet_id, player_id, round_id, game_id, kind, amount_cents, currency,
-           reference_external_transaction_id, status)
-          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING') on conflict do nothing`, [
-          proposed.id, input.providerId, input.externalTransactionId, key, payloadHash,
-          input.walletId, input.playerId, input.roundId, input.gameId, input.kind,
-          input.money.cents.toString(), input.money.currency, input.referenceExternalTransactionId ?? null,
-        ]);
-        const row = (await em.execute<TransactionRow[]>(
-          'select * from dwp.wager_transactions where idempotency_key = ? for update', [key],
-        ))[0];
-        if (!row) throw new HttpException({ code: 'EXTERNAL_IDENTITY_CONFLICT', message: 'This provider transaction already uses another idempotency key' }, 409);
-        if (row.payload_hash !== payloadHash) {
-          throw new HttpException({ code: 'IDEMPOTENCY_CONFLICT', message: 'This idempotency key was used for a different business payload' }, 409);
-        }
-        const transaction = this.transactionFromRow(row);
-        if (transaction.isTerminal()) {
-          if (!row.result) throw new Error('A terminal transaction must have a persisted response');
-          return this.completeSubmission(em, inbox?.message, { ...row.result, idempotentReplay: true });
-        }
-        await em.execute('select id from dwp.wallets where id = ? for no key update', [transaction.walletId]);
-        const record = await em.findOne(WalletRecord, { id: transaction.walletId });
-        if (!record) throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
-        const wallet = this.walletFromRecord(record);
-        transaction.fail(code);
-        const result: SubmissionResult = {
-          transactionId: transaction.id, status: transaction.status,
-          balance: wallet.balance.toJSON(), failureCode: code, idempotentReplay: false,
-        };
-        await em.execute(`update dwp.wager_transactions set status = ?, failure_code = ?, result = ?::jsonb where id = ?`, [
-          transaction.status, code, JSON.stringify(result), transaction.id,
-        ]);
-        await this.enqueue(em, WagerTransactionFailed.from(transaction, { correlationId: transaction.id }));
-        return this.completeSubmission(em, inbox?.message, result);
-      });
-    } catch (error) {
-      if (error instanceof ForeignKeyConstraintViolationException) {
-        throw new HttpException({ code: 'WALLET_NOT_FOUND', message: 'The wallet does not exist' }, 404);
+    return this.store.transaction(async store => {
+      const inbox = inboxIdentity === undefined ? undefined : await this.receiveInbox(store, inboxIdentity);
+      if (inbox?.message.isProcessed()) {
+        if (!inbox.result) throw new ApplicationError('internal', 'INTERNAL_ERROR', 'A processed inbox message must have a persisted response');
+        return this.completeSubmission(store, inbox.message, { ...inbox.result, idempotentReplay: true });
       }
-      throw error;
+      const stored = await store.acceptTransaction(proposed);
+      this.assertAcceptedIdentity(stored, payloadHash);
+      const transaction = stored.transaction;
+      if (transaction.isTerminal()) {
+        if (!stored.result) throw new ApplicationError('internal', 'INTERNAL_ERROR', 'A terminal transaction must have a persisted response');
+        return this.completeSubmission(store, inbox?.message, { ...stored.result, idempotentReplay: true });
+      }
+      const wallet = await store.lockWallet(transaction.walletId);
+      if (!wallet) throw new ApplicationError('not_found', 'WALLET_NOT_FOUND', 'The wallet does not exist');
+      transaction.fail(code);
+      const result: SubmissionResult = {
+        transactionId: transaction.id, status: transaction.status,
+        balance: wallet.balance.toJSON(), failureCode: code, idempotentReplay: false,
+      };
+      await store.saveTransaction(transaction, result);
+      await store.enqueue(WagerTransactionFailed.from(transaction, { correlationId: transaction.id }));
+      return this.completeSubmission(store, inbox?.message, result);
+    });
+  }
+
+  private assertAcceptedIdentity(stored: StoredWager | undefined, payloadHash: string): asserts stored is StoredWager {
+    if (!stored) throw new ApplicationError('conflict', 'EXTERNAL_IDENTITY_CONFLICT', 'This provider transaction already uses another idempotency key');
+    if (!stored.transaction.matchesPayload(payloadHash)) {
+      throw new ApplicationError('conflict', 'IDEMPOTENCY_CONFLICT', 'This idempotency key was used for a different business payload');
     }
   }
 
-  private async receiveInbox(em: EntityManager, identity: InboxContext & { payloadHash: string }): Promise<{
-    message: InboxMessage; result: SubmissionResult | null;
-  }> {
-    const proposed = InboxMessage.receive(identity);
-    await em.execute(`insert into dwp.inbox_messages (consumer_name, message_id, payload_hash)
-      values (?, ?, ?) on conflict do nothing`, [proposed.consumerName, proposed.messageId, proposed.payloadHash]);
-    const row = (await em.execute<InboxRow[]>(`select * from dwp.inbox_messages
-      where consumer_name = ? and message_id = ? for update`, [identity.consumerName, identity.messageId]))[0];
-    if (!row) throw new Error('The inbox identity must exist after insert');
-    if (row.payload_hash !== identity.payloadHash) {
-      throw new HttpException({ code: 'INBOX_MESSAGE_CONFLICT', message: 'This message identity was used for a different payload or idempotency key' }, 409);
+  private async receiveInbox(store: WageringTransactionPort, identity: InboxIdentity): Promise<ReceivedInbox> {
+    const inbox = await store.receiveInbox(identity);
+    if (inbox.message.payloadHash !== identity.payloadHash) {
+      throw new ApplicationError('conflict', 'INBOX_MESSAGE_CONFLICT', 'This message identity was used for a different payload or idempotency key');
     }
-    return {
-      message: InboxMessage.rehydrate({
-        consumerName: row.consumer_name, messageId: row.message_id, payloadHash: row.payload_hash,
-        receivedAt: new Date(row.received_at), processedAt: row.processed_at ? new Date(row.processed_at) : undefined,
-      }),
-      result: row.result,
-    };
+    return inbox;
   }
 
-  private async completeSubmission(em: EntityManager, inbox: InboxMessage | undefined, result: SubmissionResult): Promise<SubmissionResult> {
+  private async completeSubmission(store: WageringTransactionPort, inbox: InboxMessage | undefined, result: SubmissionResult): Promise<SubmissionResult> {
     if (inbox && !inbox.isProcessed()) {
       inbox.markProcessed(new Date());
-      await em.execute(`update dwp.inbox_messages set processed_at = ?, result = ?::jsonb
-        where consumer_name = ? and message_id = ?`, [inbox.processedAt, JSON.stringify(result), inbox.consumerName, inbox.messageId]);
+      await store.completeInbox(inbox, result);
     }
-    await this.options.beforeCommit?.();
     return result;
-  }
-
-  private transactionFromRow(row: TransactionRow): WagerTransaction {
-    return WagerTransaction.rehydrate({
-      id: row.id, providerId: row.provider_id, externalTransactionId: row.external_transaction_id,
-      idempotencyKey: row.idempotency_key, payloadHash: row.payload_hash,
-      walletId: row.wallet_id, playerId: row.player_id, roundId: row.round_id, gameId: row.game_id,
-      kind: row.kind, money: Money.fromMinorUnits(BigInt(row.amount_cents), row.currency),
-      referenceExternalTransactionId: row.reference_external_transaction_id ?? undefined,
-      referenceTransactionId: row.reference_transaction_id ?? undefined,
-      status: row.status, failureCode: row.failure_code ?? undefined,
-      createdAt: new Date(row.created_at), processedAt: row.processed_at ? new Date(row.processed_at) : undefined,
-    });
-  }
-
-  private walletFromRecord(record: WalletRecord): Wallet {
-    return Wallet.rehydrate({
-      id: record.id,
-      playerId: record.playerId,
-      currency: record.currency,
-      balance: Money.fromMinorUnits(record.balanceCents, record.currency),
-      version: record.version,
-      createdAt: record.createdAt,
-      updatedAt: record.updatedAt,
-    });
   }
 
   private walletResponse(wallet: Wallet) {
     return { id: wallet.id, playerId: wallet.playerId, balance: wallet.balance.toJSON(), version: wallet.version };
   }
 
-  private async opening(em: EntityManager, wallet: Wallet): Promise<void> {
+  private async opening(store: WageringTransactionPort, wallet: Wallet): Promise<void> {
     const transaction = WagerTransaction.create({
       id: crypto.randomUUID(),
       providerId: '__internal__',
@@ -404,41 +236,19 @@ export class WageringService {
     });
     transaction.markProcessed(undefined, wallet.createdAt);
     const result = { transactionId: transaction.id, status: transaction.status, balance: wallet.balance.toJSON(), idempotentReplay: false };
-    await em.execute(`insert into dwp.wager_transactions
-      (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
-       round_id, game_id, kind, amount_cents, currency, status, result, created_at, processed_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?, ?)`, [
-      transaction.id, transaction.providerId, transaction.externalTransactionId, transaction.idempotencyKey,
-      transaction.payloadHash, wallet.id, wallet.playerId, transaction.roundId, transaction.gameId,
-      transaction.kind, transaction.money.cents.toString(), wallet.currency, transaction.status,
-      JSON.stringify(result), transaction.createdAt, transaction.processedAt,
-    ]);
+    await store.insertOpening(transaction, result);
     const entry = WalletLedgerEntry.create({
       id: crypto.randomUUID(), walletId: wallet.id, transactionId: transaction.id,
       direction: LedgerDirection.Credit, money: wallet.balance,
       balanceBefore: Money.zero(wallet.currency), balanceAfter: wallet.balance,
       walletVersion: wallet.version, createdAt: wallet.createdAt,
     });
-    await this.insertLedger(em, entry);
+    await store.appendLedger(entry);
     const context = { correlationId: transaction.id, occurredAt: wallet.createdAt };
-    await this.enqueue(em, WagerTransactionProcessed.from(transaction, context));
-    await this.enqueue(em, WalletBalanceChanged.from(wallet, entry, context));
+    await store.enqueue(WagerTransactionProcessed.from(transaction, context));
+    await store.enqueue(WalletBalanceChanged.from(wallet, entry, context));
   }
 
-  private async insertLedger(em: EntityManager, entry: WalletLedgerEntry): Promise<void> {
-    await em.execute(`insert into dwp.wallet_ledger_entries
-      (id, wallet_id, transaction_id, direction, amount_cents, currency,
-       balance_before_cents, balance_after_cents, wallet_version, created_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-      entry.id, entry.walletId, entry.transactionId, entry.direction, entry.money.cents.toString(), entry.money.currency,
-      entry.balanceBefore.cents.toString(), entry.balanceAfter.cents.toString(), entry.walletVersion, entry.createdAt,
-    ]);
-  }
-
-  private async enqueue<T>(em: EntityManager, event: IntegrationEvent<T>): Promise<void> {
-    await em.execute(`insert into dwp.outbox_messages
-      (id, aggregate_id, event_type, payload, occurred_at) values (?, ?, ?, ?::jsonb, ?)`, [
-      event.eventId, event.aggregateId, event.eventType, JSON.stringify(event.toJSON()), event.occurredAt,
-    ]);
-  }
 }
+
+export type WageringUseCases = Pick<WageringService, 'createWallet' | 'getWallet' | 'submit' | 'reprocess' | 'failSubmission'>;

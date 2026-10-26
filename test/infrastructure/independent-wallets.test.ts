@@ -1,7 +1,8 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { LockMode } from '@mikro-orm/core';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { WalletRecord } from '../../dist/infrastructure/persistence/records.js';
 
@@ -20,7 +21,7 @@ integration('wallets progress independently under database contention', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {

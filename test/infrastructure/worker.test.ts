@@ -1,3 +1,4 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import {
   CreateQueueCommand,
@@ -9,7 +10,6 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { createSqsClient } from '../../dist/infrastructure/messaging/sqs.js';
 
@@ -84,7 +84,7 @@ integration('real worker entrypoint', () => {
   });
 
   test('consumes, commits and publishes durable events, then shuts down cleanly on SIGTERM', async () => {
-    const service = new WageringService(orm);
+    const service = createWageringService(orm);
     const wallet = await service.createWallet({
       playerId: crypto.randomUUID(), initialBalance: { amount: '100.00', currency: 'BRL' },
     });

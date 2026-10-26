@@ -1,7 +1,8 @@
+import { createWageringService } from '../../src/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { canonicalHash, wagerPayload, wagerRequest } from '../../src/application/contracts.js';
-import { WageringService } from '../../src/application/wagering-service.js';
+import type { WageringService } from '../../src/application/wagering-service.js';
 import { createDatabase } from '../../src/infrastructure/persistence/database.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -19,7 +20,7 @@ integration('Unicode identities survive PostgreSQL round trips', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {
@@ -34,7 +35,7 @@ integration('Unicode identities survive PostgreSQL round trips', () => {
 
   test('rejects malformed identity strings with INVALID_REQUEST and leaves no financial effects', async () => {
     await expect(service.createWallet({ playerId: '\ud800', initialBalance: { amount: '100.00', currency: 'BRL' } }))
-      .rejects.toMatchObject({ status: 400, response: { code: 'INVALID_REQUEST' } });
+      .rejects.toMatchObject({ kind: 'validation', code: 'INVALID_REQUEST' });
     expect(await query('select id from dwp.wallets')).toHaveLength(0);
 
     const wallet = await service.createWallet({ playerId: 'valid-player', initialBalance: { amount: '100.00', currency: 'BRL' } });
@@ -44,11 +45,11 @@ integration('Unicode identities survive PostgreSQL round trips', () => {
     };
     for (const field of ['providerId', 'externalTransactionId', 'playerId', 'walletId', 'roundId', 'gameId']) {
       await expect(service.submit({ ...body, [field]: 'bad\udfff' }, 'unicode-bad'))
-        .rejects.toMatchObject({ status: 400, response: { code: 'INVALID_REQUEST' } });
+        .rejects.toMatchObject({ kind: 'validation', code: 'INVALID_REQUEST' });
     }
-    await expect(service.submit(body, 'bad\ud800')).rejects.toMatchObject({ status: 400, response: { code: 'INVALID_REQUEST' } });
+    await expect(service.submit(body, 'bad\ud800')).rejects.toMatchObject({ kind: 'validation', code: 'INVALID_REQUEST' });
     await expect(service.submit(body, 'valid-key', { consumerName: 'consumer', messageId: 'bad\ud800' }))
-      .rejects.toMatchObject({ status: 400, response: { code: 'INVALID_REQUEST' } });
+      .rejects.toMatchObject({ kind: 'validation', code: 'INVALID_REQUEST' });
     expect(await service.getWallet(wallet.id)).toEqual(wallet);
     expect(await query("select id from dwp.wager_transactions where kind <> 'OPENING'")).toHaveLength(0);
     expect(await query('select message_id from dwp.inbox_messages')).toHaveLength(0);

@@ -1,8 +1,8 @@
 import { HttpException } from '@nestjs/common';
-import type { MikroORM } from '@mikro-orm/postgresql';
 import { wagerRequest } from '../application/contracts.js';
-import { WageringQueries } from '../application/wagering-queries.js';
-import { WageringService, type InboxContext, type SubmissionResult } from '../application/wagering-service.js';
+import type { WageringReadUseCases } from '../application/wagering-queries.js';
+import type { WageringUseCases, InboxContext, SubmissionResult } from '../application/wagering-service.js';
+import { ApplicationError } from '../application/application-error.js';
 import { DomainError } from '../domain/domain-error.js';
 import { log, type LogContext } from './logger.js';
 import { metrics } from './metrics.js';
@@ -24,7 +24,9 @@ function failure(error: unknown): { code: string; lockConflict: boolean } {
     current = detail.cause;
   }
   let code: unknown;
-  if (error instanceof HttpException) {
+  if (error instanceof ApplicationError) {
+    code = error.code;
+  } else if (error instanceof HttpException) {
     code = fields(error.getResponse())?.code;
     if (code === undefined) {
       code = ({ 400: 'INVALID_REQUEST', 404: 'NOT_FOUND', 409: 'CONFLICT', 422: 'BUSINESS_RULE_VIOLATION' } as Record<number, string>)[error.getStatus()];
@@ -53,21 +55,22 @@ function identifiers(body: unknown, context?: InboxContext): LogContext {
   }
 }
 
-export class ObservedWageringService extends WageringService {
-  constructor(orm: MikroORM, private readonly role: ProcessingRole) {
-    super(orm);
+export class ObservedWageringService implements WageringUseCases {
+  constructor(private readonly inner: WageringUseCases, private readonly role: ProcessingRole) {}
+
+  createWallet(body: unknown): ReturnType<WageringUseCases['createWallet']> { return this.inner.createWallet(body); }
+  getWallet(id: string): ReturnType<WageringUseCases['getWallet']> { return this.inner.getWallet(id); }
+
+  async submit(body: unknown, key: unknown, context?: InboxContext): Promise<SubmissionResult> {
+    return this.observed(() => this.inner.submit(body, key, context), () => identifiers(body, context));
   }
 
-  override async submit(body: unknown, key: unknown, context?: InboxContext): Promise<SubmissionResult> {
-    return this.observed(() => super.submit(body, key, context), () => identifiers(body, context));
+  async failSubmission(body: unknown, key: unknown, code: string, context?: InboxContext): Promise<SubmissionResult> {
+    return this.observed(() => this.inner.failSubmission(body, key, code, context), () => identifiers(body, context));
   }
 
-  override async failSubmission(body: unknown, key: unknown, code: string, context?: InboxContext): Promise<SubmissionResult> {
-    return this.observed(() => super.failSubmission(body, key, code, context), () => identifiers(body, context));
-  }
-
-  override async reprocess(id: string): Promise<SubmissionResult | undefined> {
-    return this.observed(() => super.reprocess(id));
+  async reprocess(id: string): Promise<SubmissionResult | undefined> {
+    return this.observed(() => this.inner.reprocess(id));
   }
 
   private async observed<T extends SubmissionResult | undefined>(work: () => Promise<T>, context: () => LogContext = () => ({})): Promise<T> {
@@ -96,16 +99,22 @@ export class ObservedWageringService extends WageringService {
   }
 }
 
-export class ObservedWageringQueries extends WageringQueries {
-  constructor(orm: MikroORM) {
-    super(orm);
+export class ObservedWageringQueries implements WageringReadUseCases {
+  constructor(private readonly inner: WageringReadUseCases) {}
+
+  getTransaction(id: string): ReturnType<WageringReadUseCases['getTransaction']> { return this.inner.getTransaction(id); }
+  getExternalTransaction(providerId: string, externalId: string): ReturnType<WageringReadUseCases['getExternalTransaction']> {
+    return this.inner.getExternalTransaction(providerId, externalId);
+  }
+  ledger(id: string, cursor?: unknown, limit?: unknown): ReturnType<WageringReadUseCases['ledger']> {
+    return this.inner.ledger(id, cursor, limit);
   }
 
-  override async reconcile(id: string) {
+  async reconcile(id: string) {
     const started = performance.now();
     const correlationId = crypto.randomUUID();
     try {
-      const result = await super.reconcile(id);
+      const result = await this.inner.reconcile(id);
       const durationMs = performance.now() - started;
       metrics.observeDuration(durationMs / 1_000, { role: 'http' });
       if (!result.consistent) metrics.increment('reconciliation_inconsistencies', { role: 'http' });

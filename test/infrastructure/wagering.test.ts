@@ -1,7 +1,8 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 import { Migration20261025000100 } from '../../dist/infrastructure/persistence/migrations/Migration20261025000100.js';
 import { Migration20261025000200 } from '../../dist/infrastructure/persistence/migrations/WageringSchema.js';
@@ -35,7 +36,7 @@ integration('wallet application transactions', () => {
       },
     });
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
     app = await createApplication(orm);
     await app.listen(0, '127.0.0.1');
     address = await app.getUrl();
@@ -88,7 +89,7 @@ integration('wallet application transactions', () => {
   test('rejects a duplicate player/currency identity without adding effects', async () => {
     const body = { playerId: crypto.randomUUID(), initialBalance: { amount: '100.00', currency: 'BRL' } };
     const wallet = await service.createWallet(body);
-    await expect(service.createWallet(body)).rejects.toMatchObject({ status: 409 });
+    await expect(service.createWallet(body)).rejects.toMatchObject({ kind: 'conflict' });
     expect(await query('select id from dwp.wallets where player_id = ?', [body.playerId])).toHaveLength(1);
     expect(await query('select id from dwp.wallet_ledger_entries where wallet_id = ?', [wallet.id])).toHaveLength(1);
     await assertConsistent(wallet.id);
@@ -96,7 +97,7 @@ integration('wallet application transactions', () => {
 
   test('rolls back opening, balance, ledger and events if the process fails before commit', async () => {
     const playerId = crypto.randomUUID();
-    const failing = new WageringService(orm, { beforeCommit: () => { throw new Error('injected-before-commit'); } });
+    const failing = createWageringService(orm, { beforeCommit: () => { throw new Error('injected-before-commit'); } });
     const initialCounts = (await query<{ count: string }>('select count(*)::text from dwp.outbox_messages'))[0]!.count;
     await expect(failing.createWallet({ playerId, initialBalance: { amount: '100.00', currency: 'BRL' } })).rejects.toThrow('injected-before-commit');
     expect(await query('select id from dwp.wallets where player_id = ?', [playerId])).toHaveLength(0);
@@ -105,11 +106,11 @@ integration('wallet application transactions', () => {
   });
 
   test('distinguishes invalid contracts, unsupported currency and unknown wallet', async () => {
-    await expect(service.createWallet({ playerId: '', initialBalance: { amount: '100.00', currency: 'BRL' } })).rejects.toMatchObject({ status: 400 });
-    await expect(service.createWallet({ playerId: 'player', initialBalance: { amount: '-0.01', currency: 'BRL' } })).rejects.toMatchObject({ status: 400 });
-    await expect(service.createWallet({ playerId: 'player', initialBalance: { amount: '1.00', currency: 'USD' } })).rejects.toMatchObject({ status: 400 });
-    await expect(service.getWallet('bad-uuid')).rejects.toMatchObject({ status: 400 });
-    await expect(service.getWallet(crypto.randomUUID())).rejects.toMatchObject({ status: 404 });
+    await expect(service.createWallet({ playerId: '', initialBalance: { amount: '100.00', currency: 'BRL' } })).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.createWallet({ playerId: 'player', initialBalance: { amount: '-0.01', currency: 'BRL' } })).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.createWallet({ playerId: 'player', initialBalance: { amount: '1.00', currency: 'USD' } })).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.getWallet('bad-uuid')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.getWallet(crypto.randomUUID())).rejects.toMatchObject({ kind: 'not_found' });
   });
 
   test('exposes wallet creation, retrieval and stable contract errors over HTTP', async () => {

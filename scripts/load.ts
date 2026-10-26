@@ -1,9 +1,10 @@
+import { createWageringService } from '../dist/infrastructure/persistence/wagering-services.js';
 import { CreateQueueCommand, DeleteQueueCommand, GetQueueAttributesCommand } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { readFile } from 'node:fs/promises';
 import { availableParallelism, cpus, freemem, platform, release, totalmem } from 'node:os';
 import { resolve } from 'node:path';
-import { WageringService, type SubmissionResult } from '../dist/application/wagering-service.js';
+import type { SubmissionResult } from '../dist/application/wagering-service.js';
 import { Money } from '../dist/domain/money.js';
 import { publisherConfiguration, type PublisherConfiguration } from '../dist/infrastructure/messaging/publisher-loop.js';
 import { createSqsClient, sqsCall } from '../dist/infrastructure/messaging/sqs.js';
@@ -353,7 +354,7 @@ async function main(): Promise<void> {
     const publisherStartFailure = publisherStarts.find(result => result.status === 'rejected');
     if (publisherStartFailure?.status === 'rejected') throw publisherStartFailure.reason;
     await publisherMetrics(publishers);
-    const service = new WageringService(orm);
+    const service = createWageringService(orm);
     for (const scenario of ['hot-wallet', 'independent-wallets'] as const) {
       for (const concurrency of [1, 10, 50]) {
         if (interrupted) throw new LoadExperimentError('INTERRUPTED', 'The load experiment was interrupted');

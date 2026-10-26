@@ -1,3 +1,4 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import {
   CreateQueueCommand,
@@ -7,7 +8,6 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
 import { SqsConsumer, type WagerCommandEnvelope, type WagerCommandResult } from '../../dist/infrastructure/messaging/sqs-consumer.js';
 import { createSqsClient } from '../../dist/infrastructure/messaging/sqs.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
@@ -135,7 +135,7 @@ integration('consumer process crash after commit and before ack', () => {
   }
 
   test('redelivers the committed message after SIGKILL without repeating any financial effect', async () => {
-    const service = new WageringService(orm);
+    const service = createWageringService(orm);
     const wallet = await service.createWallet({
       playerId: crypto.randomUUID(), initialBalance: { amount: '100.00', currency: 'BRL' },
     });
@@ -183,7 +183,7 @@ integration('consumer process crash after commit and before ack', () => {
 
       restarted = await createDatabase(databaseUrl);
       let replay: WagerCommandResult | undefined;
-      consumer = new SqsConsumer(new WageringService(restarted), sqs, commandsUrl, dlqUrl, {
+      consumer = new SqsConsumer(createWageringService(restarted), sqs, commandsUrl, dlqUrl, {
         consumerName, visibilitySeconds: 1,
         afterCommitBeforeAck: result => { replay = result; },
       });

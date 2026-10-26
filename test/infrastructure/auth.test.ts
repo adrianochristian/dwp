@@ -1,9 +1,10 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { INestApplication } from '@nestjs/common';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { decodeJwt } from 'jose';
 import { createApplication } from '../../dist/application.js';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { KeycloakIdentity } from '../../dist/auth/keycloak-identity.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
@@ -51,7 +52,7 @@ integration('Keycloak machine identities and provider authorization', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
     previousAuth = process.env.AUTH_ENABLED;
     previousIssuer = process.env.OIDC_ISSUER;
     previousAudience = process.env.OIDC_AUDIENCE;

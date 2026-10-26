@@ -1,7 +1,8 @@
+import { createWageringQueries, createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
-import { WageringQueries } from '../../dist/application/wagering-queries.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringQueries } from '../../dist/application/wagering-queries.js';
 import { Money } from '../../dist/domain/money.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
@@ -21,8 +22,8 @@ integration('consistent financial reconciliation', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
-    queries = new WageringQueries(orm);
+    service = createWageringService(orm);
+    queries = createWageringQueries(orm);
   });
 
   afterAll(async () => {
@@ -126,7 +127,7 @@ integration('consistent financial reconciliation', () => {
   });
 
   test('distinguishes malformed wallet identities from absent wallets', async () => {
-    await expect(queries.reconcile('invalid')).rejects.toMatchObject({ status: 400 });
-    await expect(queries.reconcile(crypto.randomUUID())).rejects.toMatchObject({ status: 404 });
+    await expect(queries.reconcile('invalid')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(queries.reconcile(crypto.randomUUID())).rejects.toMatchObject({ kind: 'not_found' });
   });
 });

@@ -1,7 +1,8 @@
+import { createWageringQueries, createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
-import { WageringQueries } from '../../dist/application/wagering-queries.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringQueries } from '../../dist/application/wagering-queries.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -20,8 +21,8 @@ integration('transaction lookup and stable ledger pagination', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
-    queries = new WageringQueries(orm);
+    service = createWageringService(orm);
+    queries = createWageringQueries(orm);
   });
 
   afterAll(async () => {
@@ -72,7 +73,7 @@ integration('transaction lookup and stable ledger pagination', () => {
     expect(internal).not.toHaveProperty('idempotencyKey');
     expect(internal).not.toHaveProperty('payloadHash');
     expect((await service.getWallet(wallet.id)).balance.amount).toBe('70.00');
-    await expect(queries.getExternalTransaction('another-provider', body.externalTransactionId)).rejects.toMatchObject({ status: 404 });
+    await expect(queries.getExternalTransaction('another-provider', body.externalTransactionId)).rejects.toMatchObject({ kind: 'not_found' });
     await assertConsistent(wallet.id);
   });
 
@@ -118,24 +119,24 @@ integration('transaction lookup and stable ledger pagination', () => {
     await placeBet(wallet);
     const first = await queries.ledger(wallet.id, undefined, 1);
     expect(await queries.ledger(empty.id)).toEqual({ walletId: empty.id, entries: [], nextCursor: null });
-    await expect(queries.ledger(empty.id, first.nextCursor)).rejects.toMatchObject({ status: 400 });
+    await expect(queries.ledger(empty.id, first.nextCursor)).rejects.toMatchObject({ kind: 'validation' });
     for (const cursor of ['', 'not-json', 'a===', [], null, Buffer.from('{"v":2}').toString('base64url')]) {
-      await expect(queries.ledger(wallet.id, cursor)).rejects.toMatchObject({ status: 400 });
+      await expect(queries.ledger(wallet.id, cursor)).rejects.toMatchObject({ kind: 'validation' });
     }
     for (const limit of ['0', '101', '1e1', '-1', ' 2', ['2'], null, 1.5]) {
-      await expect(queries.ledger(wallet.id, undefined, limit)).rejects.toMatchObject({ status: 400 });
+      await expect(queries.ledger(wallet.id, undefined, limit)).rejects.toMatchObject({ kind: 'validation' });
     }
     await assertConsistent(wallet.id);
     await assertConsistent(empty.id);
   });
 
   test('distinguishes malformed identities and absent resources', async () => {
-    await expect(queries.getTransaction('invalid')).rejects.toMatchObject({ status: 400 });
-    await expect(queries.getTransaction(crypto.randomUUID())).rejects.toMatchObject({ status: 404 });
-    await expect(queries.getExternalTransaction('', 'external')).rejects.toMatchObject({ status: 400 });
-    await expect(queries.getExternalTransaction('provider', '')).rejects.toMatchObject({ status: 400 });
-    await expect(queries.getExternalTransaction('provider', crypto.randomUUID())).rejects.toMatchObject({ status: 404 });
-    await expect(queries.ledger('invalid')).rejects.toMatchObject({ status: 400 });
-    await expect(queries.ledger(crypto.randomUUID())).rejects.toMatchObject({ status: 404 });
+    await expect(queries.getTransaction('invalid')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(queries.getTransaction(crypto.randomUUID())).rejects.toMatchObject({ kind: 'not_found' });
+    await expect(queries.getExternalTransaction('', 'external')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(queries.getExternalTransaction('provider', '')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(queries.getExternalTransaction('provider', crypto.randomUUID())).rejects.toMatchObject({ kind: 'not_found' });
+    await expect(queries.ledger('invalid')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(queries.ledger(crypto.randomUUID())).rejects.toMatchObject({ kind: 'not_found' });
   });
 });

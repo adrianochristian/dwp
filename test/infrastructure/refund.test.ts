@@ -1,6 +1,7 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -18,7 +19,7 @@ integration('full BET refunds', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {
@@ -240,8 +241,8 @@ integration('full BET refunds', () => {
   test('requires a nonempty reference and positive amount at the contract boundary', async () => {
     const { refund } = await fixture();
     const { referenceExternalTransactionId: _reference, ...withoutReference } = refund;
-    await expect(service.submit(withoutReference, crypto.randomUUID())).rejects.toMatchObject({ status: 400 });
-    await expect(service.submit({ ...refund, referenceExternalTransactionId: '' }, crypto.randomUUID())).rejects.toMatchObject({ status: 400 });
-    await expect(service.submit({ ...refund, money: { amount: '0.00', currency: 'BRL' } }, crypto.randomUUID())).rejects.toMatchObject({ status: 400 });
+    await expect(service.submit(withoutReference, crypto.randomUUID())).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.submit({ ...refund, referenceExternalTransactionId: '' }, crypto.randomUUID())).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.submit({ ...refund, money: { amount: '0.00', currency: 'BRL' } }, crypto.randomUUID())).rejects.toMatchObject({ kind: 'validation' });
   });
 });

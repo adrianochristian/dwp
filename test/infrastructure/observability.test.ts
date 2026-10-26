@@ -1,3 +1,4 @@
+import { createWageringQueries, createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
@@ -26,8 +27,8 @@ integration('committed financial observability without sensitive payloads', () =
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new ObservedWageringService(orm, 'http');
-    queries = new ObservedWageringQueries(orm);
+    service = new ObservedWageringService(createWageringService(orm), 'http');
+    queries = new ObservedWageringQueries(createWageringQueries(orm));
   });
 
   afterAll(async () => {
@@ -83,7 +84,7 @@ integration('committed financial observability without sensitive payloads', () =
     const logs = spyOn(console, 'log').mockImplementation(() => {});
     try {
       await expect(service.submit({ providerId: 'unvalidated-private-value', payload: 'private-raw-payload' }, key))
-        .rejects.toMatchObject({ status: 400 });
+        .rejects.toMatchObject({ kind: 'validation' });
       await orm.em.fork().execute(`create function dwp.observed_lock_fault() returns trigger language plpgsql as $$
         begin raise exception 'private SQL detail that must not be logged' using errcode = '40P01'; end $$;
         create trigger observed_lock_fault before insert on dwp.wager_transactions

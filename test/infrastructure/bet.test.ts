@@ -1,6 +1,7 @@
+import { createWageringService } from '../../dist/infrastructure/persistence/wagering-services.js';
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { WageringService } from '../../dist/application/wagering-service.js';
+import type { WageringService } from '../../dist/application/wagering-service.js';
 import { canonicalHash } from '../../dist/application/contracts.js';
 import { createDatabase } from '../../dist/infrastructure/persistence/database.js';
 
@@ -19,7 +20,7 @@ integration('persistent BET processing', () => {
     url.pathname = `/${databaseName}`;
     orm = await createDatabase(url.toString());
     await orm.migrator.up();
-    service = new WageringService(orm);
+    service = createWageringService(orm);
   });
 
   afterAll(async () => {
@@ -70,7 +71,7 @@ integration('persistent BET processing', () => {
     const original = await service.submit(body, key);
     await service.submit({ ...body, externalTransactionId: crypto.randomUUID(), money: { amount: '10.00', currency: 'BRL' } }, crypto.randomUUID());
     expect((await service.getWallet(wallet.id)).balance.amount).toBe('65.00');
-    const restarted = new WageringService(orm);
+    const restarted = createWageringService(orm);
     expect(await restarted.submit(body, key)).toEqual({ ...original, idempotentReplay: true });
     expect(await query("select id from dwp.wallet_ledger_entries where wallet_id = ? and direction = 'DEBIT'", [wallet.id])).toHaveLength(2);
     await assertConsistent(wallet.id);
@@ -79,8 +80,8 @@ integration('persistent BET processing', () => {
   test('rejects divergent payload under one key and external identity under another key', async () => {
     const { wallet, body, key } = await fixture();
     await service.submit(body, key);
-    await expect(service.submit({ ...body, money: { amount: '26.00', currency: 'BRL' } }, key)).rejects.toMatchObject({ status: 409, response: { code: 'IDEMPOTENCY_CONFLICT' } });
-    await expect(service.submit(body, `${key}:other`)).rejects.toMatchObject({ status: 409, response: { code: 'EXTERNAL_IDENTITY_CONFLICT' } });
+    await expect(service.submit({ ...body, money: { amount: '26.00', currency: 'BRL' } }, key)).rejects.toMatchObject({ kind: 'conflict', code: 'IDEMPOTENCY_CONFLICT' });
+    await expect(service.submit(body, `${key}:other`)).rejects.toMatchObject({ kind: 'conflict', code: 'EXTERNAL_IDENTITY_CONFLICT' });
     expect((await service.getWallet(wallet.id)).balance.amount).toBe('75.00');
     expect(await query('select id from dwp.wager_transactions where wallet_id = ? and kind = ?', [wallet.id, 'BET'])).toHaveLength(1);
     await assertConsistent(wallet.id);
@@ -116,7 +117,7 @@ integration('persistent BET processing', () => {
 
   test('rolls back every BET effect before commit and permits a clean retry', async () => {
     const { wallet, body, key } = await fixture();
-    const failing = new WageringService(orm, { beforeCommit: () => { throw new Error('injected-BET-before-commit'); } });
+    const failing = createWageringService(orm, { beforeCommit: () => { throw new Error('injected-BET-before-commit'); } });
     await expect(failing.submit(body, key)).rejects.toThrow('injected-BET-before-commit');
     expect((await service.getWallet(wallet.id)).balance.amount).toBe('100.00');
     expect(await query('select id from dwp.wager_transactions where idempotency_key = ?', [key])).toHaveLength(0);
@@ -128,9 +129,9 @@ integration('persistent BET processing', () => {
 
   test('uses the required header, validates kind and amount, and distinguishes an unknown wallet', async () => {
     const { body } = await fixture();
-    await expect(service.submit(body, undefined)).rejects.toMatchObject({ status: 400 });
-    await expect(service.submit({ ...body, kind: 'OPENING' }, 'invalid-opening')).rejects.toMatchObject({ status: 400 });
-    await expect(service.submit({ ...body, money: { amount: '0.00', currency: 'BRL' } }, 'invalid-zero')).rejects.toMatchObject({ status: 400 });
-    await expect(service.submit({ ...body, walletId: crypto.randomUUID() }, 'missing-wallet')).rejects.toMatchObject({ status: 404 });
+    await expect(service.submit(body, undefined)).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.submit({ ...body, kind: 'OPENING' }, 'invalid-opening')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.submit({ ...body, money: { amount: '0.00', currency: 'BRL' } }, 'invalid-zero')).rejects.toMatchObject({ kind: 'validation' });
+    await expect(service.submit({ ...body, walletId: crypto.randomUUID() }, 'missing-wallet')).rejects.toMatchObject({ kind: 'not_found' });
   });
 });
