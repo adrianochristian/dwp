@@ -1,0 +1,37 @@
+name: dwp
+
+services:
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: dwp
+      POSTGRES_PASSWORD: dwp
+      POSTGRES_DB: dwp
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dwp -d dwp"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ministack:
+    image: ghcr.io/ministackorg/ministack:1.5.32
+    environment:
+      PERSIST_STATE: "1"
+      STATE_DIR: /var/lib/ministack
+    ports:
+      - "127.0.0.1:${SQS_PORT:-4566}:4566"
+    volumes:
+      - ministack-data:/var/lib/ministack
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4566/_ministack/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
+  ministack-data:

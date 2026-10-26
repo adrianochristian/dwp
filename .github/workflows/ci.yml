@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - feat/distributed-wagering-processor
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Build, types and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run typecheck
+      - run: bun run test
+
+  integration:
+    name: PostgreSQL and SQS integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      DATABASE_URL: postgresql://dwp:dwp@127.0.0.1:5432/dwp
+      SQS_ENDPOINT: http://127.0.0.1:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: docker compose up -d --wait
+      - run: bun run queues:init
+      - run: bun run migration:up
+      - run: bun run test:integration
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Stop containers
+        if: always()
+        run: docker compose down -v
+
+  authentication:
+    name: Keycloak authentication and provider access
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      DATABASE_URL: postgresql://dwp:dwp@127.0.0.1:5432/dwp
+      SQS_ENDPOINT: http://127.0.0.1:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AUTH_ENABLED: "true"
+      OIDC_ISSUER: http://127.0.0.1:8080/realms/dwp
+      OIDC_AUDIENCE: dwp-api
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - name: Generate ephemeral client credentials
+        run: |
+          python3 - <<'PY'
+          import os
+          import secrets
+
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as environment:
+              environment.write('KEYCLOAK_ADMIN_USERNAME=dwp-ci-admin\n')
+              for variable in [
+                  'KEYCLOAK_ADMIN_PASSWORD',
+                  'PROVIDER_A_CLIENT_SECRET',
+                  'PROVIDER_B_CLIENT_SECRET',
+                  'OPERATOR_CLIENT_SECRET',
+              ]:
+                  environment.write(f'{variable}={secrets.token_urlsafe(32)}\n')
+          PY
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: docker compose -f compose.yaml -f compose.auth.yaml up -d --wait --wait-timeout 300
+      - run: bun run test:auth
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose -f compose.yaml -f compose.auth.yaml logs --no-color
+      - name: Stop containers
+        if: always()
+        run: docker compose -f compose.yaml -f compose.auth.yaml down -v
