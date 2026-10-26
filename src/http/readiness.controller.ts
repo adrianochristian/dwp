@@ -1,7 +1,7 @@
 import { GetQueueAttributesCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { Controller, Get, Header, Inject, ServiceUnavailableException } from '@nestjs/common';
-import { getQueueUrl, queueNames } from '../infrastructure/messaging/sqs.js';
+import { getQueueUrl, queueNames, sqsCall } from '../infrastructure/messaging/sqs.js';
 import { metrics } from '../observability/metrics.js';
 import { Access } from '../auth/access.decorator.js';
 
@@ -21,10 +21,10 @@ export class OperationalController {
         this.database.em.fork().getConnection().execute('SELECT 1'),
         ...[queueNames.commands, queueNames.events].map(async name => {
           const url = await getQueueUrl(this.sqsClient, name, signal);
-          await this.sqsClient.send(new GetQueueAttributesCommand({
+          await sqsCall(abortSignal => this.sqsClient.send(new GetQueueAttributesCommand({
             QueueUrl: url,
             AttributeNames: ['QueueArn'],
-          }), { abortSignal: signal });
+          }), { abortSignal }), { signal });
         }),
       ]);
       return { status: 'ok' };

@@ -7,6 +7,8 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import { createHash } from 'node:crypto';
+import { sqsCall, type ShutdownOptions } from './sqs.js';
+import { normalizeShutdownOptions, waitForSettlement } from './shutdown.js';
 
 export interface WagerCommandContext {
   consumerName: string;
@@ -35,6 +37,7 @@ export interface SqsConsumerOptions {
   consumerName?: string;
   visibilitySeconds?: number;
   maxAttempts?: number;
+  operationTimeoutMs?: number;
   afterCommitBeforeAck?: (result: WagerCommandResult, message: WagerCommandEnvelope) => Promise<void> | void;
   onError?: (error: unknown) => void;
   onRetry?: (observation: SqsConsumerObservation) => void;
@@ -52,12 +55,24 @@ export interface SqsConsumerObservation {
   delaySeconds?: number;
 }
 
+export interface SqsReceiveOptions {
+  waitTimeSeconds?: number;
+  maxMessages?: number;
+  signal?: AbortSignal;
+}
+
 interface InFlight {
   message: Message;
   receipt: string;
   released: boolean;
+  controller: AbortController;
+  acknowledged?: boolean;
   heartbeatTimer?: ReturnType<typeof setInterval>;
+  heartbeatStopped?: boolean;
+  heartbeatController?: AbortController;
   heartbeatTask?: Promise<void>;
+  releaseTask?: Promise<void>;
+  removeCallerListener?: () => void;
   task?: Promise<void>;
 }
 
@@ -122,6 +137,7 @@ export class SqsConsumer {
   private readonly inFlight = new Map<string, InFlight>();
   private readonly receivers = new Set<AbortController>();
   private readonly runs = new Set<Promise<number>>();
+  private readonly retryWaits = new Set<() => void>();
   private stopping = false;
   private stopTask: Promise<void> | undefined;
 
@@ -139,17 +155,39 @@ export class SqsConsumer {
       || !Number.isInteger(this.maxAttempts) || this.maxAttempts < 1) {
       throw new Error('Invalid SQS visibility timeout or attempt limit');
     }
+    if (options.operationTimeoutMs !== undefined
+      && (!Number.isSafeInteger(options.operationTimeoutMs) || options.operationTimeoutMs < 1
+        || options.operationTimeoutMs > 2_147_483_647)) {
+      throw new Error('Invalid SQS operation timeout');
+    }
   }
 
-  runOnce(options: { waitTimeSeconds?: number; maxMessages?: number } = {}): Promise<number> {
+  runOnce(options: SqsReceiveOptions = {}): Promise<number> {
     const task = this.receiveOnce(options);
     this.runs.add(task);
     task.then(() => this.runs.delete(task), () => this.runs.delete(task));
-    return task;
+    if (!options.signal) return task;
+    const signal = options.signal;
+    return new Promise<number>((resolve, reject) => {
+      const aborted = () => {
+        signal.removeEventListener('abort', aborted);
+        reject(signal.reason ?? new DOMException('SQS receive cancelled', 'AbortError'));
+      };
+      signal.addEventListener('abort', aborted, { once: true });
+      task.then(value => {
+        signal.removeEventListener('abort', aborted);
+        resolve(value);
+      }, error => {
+        signal.removeEventListener('abort', aborted);
+        reject(error);
+      });
+      if (signal.aborted) aborted();
+    });
   }
 
-  private async receiveOnce(options: { waitTimeSeconds?: number; maxMessages?: number }): Promise<number> {
+  private async receiveOnce(options: SqsReceiveOptions): Promise<number> {
     if (this.stopping) return 0;
+    if (options.signal?.aborted) throw options.signal.reason ?? new DOMException('SQS receive cancelled', 'AbortError');
     const waitTimeSeconds = options.waitTimeSeconds ?? 0;
     const maxMessages = options.maxMessages ?? 10;
     if (!Number.isInteger(waitTimeSeconds) || waitTimeSeconds < 0 || waitTimeSeconds > 20
@@ -157,27 +195,39 @@ export class SqsConsumer {
       throw new Error('Invalid SQS receive options');
     }
     const receiver = new AbortController();
+    const cancelReceive = () => receiver.abort(options.signal?.reason);
+    options.signal?.addEventListener('abort', cancelReceive, { once: true });
     this.receivers.add(receiver);
     let messages: Message[];
     try {
-      const response = await this.sqs.send(new ReceiveMessageCommand({
+      const response = await this.transport(signal => this.sqs.send(new ReceiveMessageCommand({
         QueueUrl: this.commandsUrl,
         MaxNumberOfMessages: maxMessages,
         WaitTimeSeconds: waitTimeSeconds,
         VisibilityTimeout: this.visibilitySeconds,
         MessageSystemAttributeNames: ['ApproximateReceiveCount', 'MessageGroupId'],
-      }), { abortSignal: receiver.signal });
+      }), { abortSignal: signal }), receiver.signal);
       messages = response.Messages ?? [];
     } catch (error) {
       if (this.stopping && receiver.signal.aborted) return 0;
       throw error;
     } finally {
+      options.signal?.removeEventListener('abort', cancelReceive);
       this.receivers.delete(receiver);
     }
     const tasks = messages.map(message => {
       if (!message.ReceiptHandle) return Promise.reject(new Error('SQS returned a message without a receipt handle'));
-      const entry: InFlight = { message, receipt: message.ReceiptHandle, released: false };
+      const entry: InFlight = {
+        message, receipt: message.ReceiptHandle, released: false, controller: new AbortController(),
+      };
       this.inFlight.set(entry.receipt, entry);
+      if (options.signal) {
+        const signal = options.signal;
+        const cancelled = () => { void this.release(entry, 3_000, signal.reason); };
+        signal.addEventListener('abort', cancelled, { once: true });
+        entry.removeCallerListener = () => signal.removeEventListener('abort', cancelled);
+        if (signal.aborted) cancelled();
+      }
       entry.task = this.stopping ? this.release(entry) : this.process(entry);
       return entry.task;
     });
@@ -192,30 +242,33 @@ export class SqsConsumer {
       try { await this.runOnce({ waitTimeSeconds: 20 }); } catch (error) {
         if (this.stopping) break;
         this.reportError(error);
-        await new Promise<void>(resolve => { setTimeout(resolve, 1_000); });
+        await this.waitForRetry();
       }
     }
   }
 
-  stop(timeoutMs = 10_000): Promise<void> {
-    if (!this.stopTask) this.stopTask = this.drain(timeoutMs);
+  quiesce(): void {
+    this.stopping = true;
+    for (const receiver of this.receivers) receiver.abort(new DOMException('SQS consumer stopping', 'AbortError'));
+    for (const wake of this.retryWaits) wake();
+  }
+
+  stop(options: number | ShutdownOptions = 10_000): Promise<void> {
+    if (!this.stopTask) this.stopTask = this.drain(options);
     return this.stopTask;
   }
 
-  private async drain(timeoutMs: number): Promise<void> {
-    this.stopping = true;
-    for (const receiver of this.receivers) receiver.abort();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
-      Promise.allSettled(this.runs),
-      new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, timeoutMs)); }),
-    ]).finally(() => clearTimeout(timer));
+  private async drain(options: number | ShutdownOptions): Promise<void> {
+    const { timeoutMs, cleanupMs, signal } = normalizeShutdownOptions(options);
+    this.quiesce();
+    await waitForSettlement(this.runs, timeoutMs, signal);
     const entries = [...this.inFlight.values()];
     for (const entry of entries) entry.released = true;
-    await Promise.allSettled(entries.map(entry => this.release(entry)));
+    await waitForSettlement(entries.map(entry => this.release(entry, cleanupMs, signal?.reason)), cleanupMs);
   }
 
   private async process(entry: InFlight): Promise<void> {
+    if (entry.released) return;
     this.startHeartbeat(entry);
     let envelope: WagerCommandEnvelope | undefined;
     try {
@@ -227,7 +280,6 @@ export class SqsConsumer {
       if (entry.released) return;
       await this.options.afterCommitBeforeAck?.(result, envelope);
       if (entry.released) return;
-      await this.stopHeartbeat(entry);
       if (result.status === 'FAILED') {
         const code = result.failureCode ?? 'PROCESSING_FAILED';
         await this.deadLetter(entry, code);
@@ -245,7 +297,6 @@ export class SqsConsumer {
       });
     } catch (error) {
       if (entry.released) return;
-      await this.stopHeartbeat(entry);
       if (statusCode(error) === 422) {
         await this.ack(entry);
         this.observe(this.options.onProcessed, {
@@ -265,10 +316,12 @@ export class SqsConsumer {
               consumerName: this.consumerName, messageId: envelope.messageId,
             });
           } catch (auditError) {
+            if (entry.released) return;
             // The original command remains recoverable in the DLQ if the database is unavailable.
             this.reportError(auditError);
           }
         }
+        if (entry.released) return;
         await this.deadLetter(entry, code);
         this.observe(this.options.onDeadLetter, {
           consumerName: this.consumerName,
@@ -279,11 +332,13 @@ export class SqsConsumer {
         });
       } else {
         const delaySeconds = Math.min(60, 2 ** Math.min(attempt - 1, 6));
-        await this.sqs.send(new ChangeMessageVisibilityCommand({
+        await this.stopHeartbeat(entry);
+        if (entry.released) return;
+        await this.transport(signal => this.sqs.send(new ChangeMessageVisibilityCommand({
           QueueUrl: this.commandsUrl,
           ReceiptHandle: entry.receipt,
           VisibilityTimeout: delaySeconds,
-        }));
+        }), { abortSignal: signal }), entry.controller.signal);
         this.observe(this.options.onRetry, {
           consumerName: this.consumerName,
           messageId: envelope?.messageId ?? entry.message.MessageId ?? 'unknown',
@@ -292,40 +347,54 @@ export class SqsConsumer {
       }
     } finally {
       await this.stopHeartbeat(entry);
-      this.inFlight.delete(entry.receipt);
+      entry.removeCallerListener?.();
+      if (!entry.releaseTask) this.inFlight.delete(entry.receipt);
     }
   }
 
   private startHeartbeat(entry: InFlight): void {
+    entry.heartbeatStopped = false;
     entry.heartbeatTimer = setInterval(() => {
-      if (entry.released || entry.heartbeatTask) return;
-      entry.heartbeatTask = this.sqs.send(new ChangeMessageVisibilityCommand({
+      if (entry.released || entry.heartbeatStopped || entry.heartbeatTask) return;
+      const controller = new AbortController();
+      entry.heartbeatController = controller;
+      const signal = AbortSignal.any([entry.controller.signal, controller.signal]);
+      entry.heartbeatTask = this.transport(abortSignal => this.sqs.send(new ChangeMessageVisibilityCommand({
         QueueUrl: this.commandsUrl,
         ReceiptHandle: entry.receipt,
         VisibilityTimeout: this.visibilitySeconds,
-      }), { abortSignal: AbortSignal.timeout(Math.max(500, Math.min(3_000, this.visibilitySeconds * 500))) })
-        .then(() => undefined).catch(error => { this.reportError(error); }).finally(() => {
+      }), { abortSignal }), signal, Math.max(500, Math.min(3_000, this.visibilitySeconds * 500)))
+        .then(() => undefined).catch(error => {
+          if (!controller.signal.aborted && !entry.released) this.reportError(error);
+        }).finally(() => {
         delete entry.heartbeatTask;
+        if (entry.heartbeatController === controller) delete entry.heartbeatController;
       });
     }, Math.max(250, Math.floor(this.visibilitySeconds * 1_000 / 3)));
     entry.heartbeatTimer.unref();
   }
 
   private async stopHeartbeat(entry: InFlight): Promise<void> {
+    entry.heartbeatStopped = true;
     clearInterval(entry.heartbeatTimer);
+    entry.heartbeatController?.abort(new DOMException('SQS heartbeat stopped', 'AbortError'));
     await entry.heartbeatTask;
   }
 
   private async ack(entry: InFlight): Promise<void> {
     if (!entry.released) {
-      await this.sqs.send(new DeleteMessageCommand({ QueueUrl: this.commandsUrl, ReceiptHandle: entry.receipt }));
+      await this.transport(signal => this.sqs.send(new DeleteMessageCommand({
+        QueueUrl: this.commandsUrl, ReceiptHandle: entry.receipt,
+      }), { abortSignal: signal }), entry.controller.signal);
+      entry.acknowledged = true;
     }
   }
 
   private async deadLetter(entry: InFlight, code: string): Promise<void> {
+    if (entry.released) return;
     const sourceId = entry.message.MessageId ?? createHash('sha256').update(entry.message.Body ?? '').digest('hex');
     const deduplicationId = createHash('sha256').update(`${this.commandsUrl}\0${sourceId}\0${code}`).digest('hex');
-    await this.sqs.send(new SendMessageCommand({
+    await this.transport(signal => this.sqs.send(new SendMessageCommand({
       QueueUrl: this.dlqUrl,
       MessageBody: entry.message.Body ?? '{}',
       MessageGroupId: entry.message.Attributes?.MessageGroupId ?? 'invalid-command',
@@ -334,25 +403,53 @@ export class SqsConsumer {
         failureCode: { DataType: 'String', StringValue: code },
         sourceMessageId: { DataType: 'String', StringValue: sourceId },
       },
-    }));
+    }), { abortSignal: signal }), entry.controller.signal);
     await this.ack(entry);
   }
 
-  private async release(entry: InFlight): Promise<void> {
+  private release(entry: InFlight, cleanupMs = 3_000, reason?: unknown): Promise<void> {
+    if (entry.releaseTask) return entry.releaseTask;
     entry.released = true;
+    entry.removeCallerListener?.();
+    entry.controller.abort(reason ?? new DOMException('SQS delivery released', 'AbortError'));
+    entry.releaseTask = this.releaseVisibility(entry, cleanupMs);
+    return entry.releaseTask;
+  }
+
+  private async releaseVisibility(entry: InFlight, cleanupMs: number): Promise<void> {
     await this.stopHeartbeat(entry);
     try {
-      await this.sqs.send(new ChangeMessageVisibilityCommand({
+      if (entry.acknowledged || cleanupMs === 0) return;
+      await this.transport(signal => this.sqs.send(new ChangeMessageVisibilityCommand({
         QueueUrl: this.commandsUrl,
         ReceiptHandle: entry.receipt,
         VisibilityTimeout: 0,
-      }), { abortSignal: AbortSignal.timeout(3_000) });
+      }), { abortSignal: signal }), undefined, cleanupMs);
     } catch (error) {
       this.reportError(error);
-      throw error;
     } finally {
       this.inFlight.delete(entry.receipt);
     }
+  }
+
+  private transport<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal, timeoutMs = this.options.operationTimeoutMs): Promise<T> {
+    return sqsCall(operation, {
+      ...(signal ? { signal } : {}),
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
+  }
+
+  private waitForRetry(): Promise<void> {
+    return new Promise(resolve => {
+      const wake = () => {
+        clearTimeout(timer);
+        this.retryWaits.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, 1_000);
+      this.retryWaits.add(wake);
+      if (this.stopping) wake();
+    });
   }
 
   private reportError(error: unknown): void {

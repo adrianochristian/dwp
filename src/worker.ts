@@ -8,31 +8,68 @@ import { createOperationalApplication } from './observability/operational-server
 import { metrics } from './observability/metrics.js';
 import { log } from './observability/logger.js';
 import type { INestApplication } from '@nestjs/common';
+import type { MikroORM } from '@mikro-orm/postgresql';
 
-export async function runWorker(): Promise<void> {
+export interface WorkerShutdownOptions {
+  drainMs?: number;
+  cleanupMs?: number;
+  deadlineMs?: number;
+}
+
+export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<void> {
   const role = process.env.WORKER_ROLE ?? 'all';
   if (!['publisher', 'consumer', 'reference', 'all'].includes(role)) throw new Error('Invalid WORKER_ROLE');
   const metricsPort = process.env.WORKER_METRICS_PORT ?? '0';
   if (!/^\d+$/.test(metricsPort) || BigInt(metricsPort) > 65535n) throw new Error('Invalid WORKER_METRICS_PORT');
-  const database = await createDatabase();
+  const drainMs = shutdown.drainMs ?? 10_000;
+  const cleanupMs = shutdown.cleanupMs ?? 3_000;
+  const deadlineMs = shutdown.deadlineMs ?? 15_000;
+  if (![drainMs, cleanupMs, deadlineMs].every(value => Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647)
+    || deadlineMs <= drainMs + cleanupMs) throw new Error('Invalid worker shutdown budgets');
+  let database: MikroORM | undefined;
   const sqs = createSqsClient();
   let publisher: OutboxPublisher | undefined;
   let consumer: SqsConsumer | undefined;
   let references: ReferenceWorker | undefined;
   let operational: INestApplication | undefined;
+  const loops: Promise<unknown>[] = [];
   let stopping = false;
-  let resolveStop: () => void;
+  let shutdownStartedAt: number | undefined;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const startup = new AbortController();
+  const shutdownDeadline = new AbortController();
+  let resolveStop!: () => void;
   const stopped = new Promise<void>(resolve => { resolveStop = resolve; });
-  const requestStop = () => { stopping = true; resolveStop(); };
+  const requestStop = () => {
+    if (stopping) return;
+    stopping = true;
+    shutdownStartedAt = performance.now();
+    startup.abort(new DOMException('Worker shutting down', 'AbortError'));
+    consumer?.quiesce();
+    references?.quiesce();
+    publisher?.quiesce();
+    watchdog = setTimeout(() => {
+      shutdownDeadline.abort(new DOMException('Worker shutdown deadline exceeded', 'AbortError'));
+      try {
+        log('worker_shutdown_deadline', { code: 'SHUTDOWN_DEADLINE_EXCEEDED' });
+      } finally {
+        process.exit(1);
+      }
+    }, deadlineMs);
+    watchdog.unref();
+    resolveStop();
+  };
   process.on('SIGINT', requestStop);
   process.on('SIGTERM', requestStop);
   try {
+    database = await createDatabase();
+    if (stopping) return;
     operational = await createOperationalApplication(database, sqs);
     await operational.listen(Number(metricsPort), '127.0.0.1');
-    const loops: Promise<unknown>[] = [];
+    if (stopping) return;
     if (role === 'publisher' || role === 'all') {
       publisher = new OutboxPublisher(database, sqs,
-        process.env.EVENT_QUEUE_URL ?? await getQueueUrl(sqs, queueNames.events), {
+        process.env.EVENT_QUEUE_URL ?? await getQueueUrl(sqs, queueNames.events, startup.signal), {
           onRetry: message => {
             metrics.increment('retries', { role: 'publisher' });
             log('outbox_retry', { messageId: message.id, correlationId: message.id, attempt: message.attempts, code: 'SQS_PUBLISH_FAILED' });
@@ -51,8 +88,8 @@ export async function runWorker(): Promise<void> {
     }
     if (role === 'consumer' || role === 'all') {
       const [commands, deadLetters] = await Promise.all([
-        process.env.COMMAND_QUEUE_URL ?? getQueueUrl(sqs, queueNames.commands),
-        process.env.DLQ_QUEUE_URL ?? getQueueUrl(sqs, queueNames.deadLetters),
+        process.env.COMMAND_QUEUE_URL ?? getQueueUrl(sqs, queueNames.commands, startup.signal),
+        process.env.DLQ_QUEUE_URL ?? getQueueUrl(sqs, queueNames.deadLetters, startup.signal),
       ]);
       consumer = new SqsConsumer(new ObservedWageringService(database, 'sqs'), sqs, commands, deadLetters, {
         onError: () => log('consumer_cycle_failed', { code: 'INFRASTRUCTURE_UNAVAILABLE' }),
@@ -94,16 +131,25 @@ export async function runWorker(): Promise<void> {
     }
     console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid, metricsAddress: await operational.getUrl() }));
     await Promise.race([Promise.all(loops), stopped]);
+  } catch (error) {
+    if (!stopping) throw error;
   } finally {
-    stopping = true;
-    process.off('SIGINT', requestStop);
-    process.off('SIGTERM', requestStop);
-    await consumer?.stop(10_000);
-    await references?.stop();
-    await publisher?.stop();
-    await operational?.close();
-    sqs.destroy();
-    await database.close(true);
+    requestStop();
+    const remainingDrain = Math.max(0, Math.floor(drainMs - (performance.now() - shutdownStartedAt!)));
+    const options = { timeoutMs: remainingDrain, cleanupMs, signal: shutdownDeadline.signal };
+    try {
+      // Every role shares one drain window, rather than waiting serially for
+      // consumer, references and publisher to each spend a separate timeout.
+      await Promise.allSettled([consumer?.stop(options), references?.stop(options), publisher?.stop(options)]);
+      sqs.destroy();
+      // SQL may be waiting on an external lock. The process watchdog remains
+      // armed through pool/HTTP cleanup; close(true) is not a query cancellation.
+      await Promise.allSettled([...loops, operational?.close(), database?.close(true)]);
+    } finally {
+      clearTimeout(watchdog);
+      process.off('SIGINT', requestStop);
+      process.off('SIGTERM', requestStop);
+    }
   }
 }
 

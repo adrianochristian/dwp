@@ -1,4 +1,6 @@
 import type { MikroORM } from '@mikro-orm/postgresql';
+import type { ShutdownOptions } from '../infrastructure/messaging/sqs.js';
+import { normalizeShutdownOptions, waitForSettlement } from '../infrastructure/messaging/shutdown.js';
 
 export interface ReferenceHandler {
   reprocess(id: string): Promise<unknown>;
@@ -14,6 +16,7 @@ export class ReferenceWorker {
   private readonly batchSize: number;
   private readonly active = new Set<Promise<number>>();
   private stopped = false;
+  private stopTask: Promise<void> | undefined;
 
   constructor(
     private readonly orm: MikroORM,
@@ -37,9 +40,17 @@ export class ReferenceWorker {
     }
   }
 
-  async stop(): Promise<void> {
+  quiesce(): void {
     this.stopped = true;
-    await Promise.allSettled(this.active);
+  }
+
+  stop(input: number | ShutdownOptions = {}): Promise<void> {
+    if (!this.stopTask) {
+      const options = normalizeShutdownOptions(input);
+      this.quiesce();
+      this.stopTask = waitForSettlement(this.active, options.timeoutMs, options.signal).then(() => undefined);
+    }
+    return this.stopTask;
   }
 
   private async processBatch(): Promise<number> {
@@ -49,6 +60,7 @@ export class ReferenceWorker {
       select id from dwp.wager_transactions
       where status = 'PENDING_REFERENCE' and next_attempt_at <= clock_timestamp()
       order by next_attempt_at, id limit ?`, [this.batchSize]);
+    if (this.stopped) return 0;
     const results = await Promise.allSettled(due.map(async ({ id }) => {
       try {
         const result = await this.handler.reprocess(id);

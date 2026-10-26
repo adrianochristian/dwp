@@ -1,6 +1,8 @@
 import { SendMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { OutboxMessage } from '../../domain/outbox-message.js';
+import { sqsCall, type ShutdownOptions } from './sqs.js';
+import { normalizeShutdownOptions, waitForSettlement } from './shutdown.js';
 
 export interface OutboxDelivery {
   readonly id: string;
@@ -14,6 +16,7 @@ export interface OutboxDelivery {
 export interface OutboxPublisherOptions {
   leaseMs?: number;
   batchSize?: number;
+  operationTimeoutMs?: number;
   beforeSend?: (message: OutboxDelivery) => Promise<void> | void;
   afterSend?: (message: OutboxDelivery) => Promise<void> | void;
   onRetry?: (message: OutboxDelivery, error: unknown) => void;
@@ -30,11 +33,21 @@ interface ClaimedRow {
   lease_token: string;
 }
 
+interface ActiveDelivery {
+  id: string;
+  token: string;
+  abort: AbortController;
+  stopHeartbeat(): void;
+}
+
 export class OutboxPublisher {
   private readonly leaseMs: number;
   private readonly batchSize: number;
   private readonly active = new Set<Promise<number>>();
+  private readonly deliveries = new Set<ActiveDelivery>();
   private stopped = false;
+  private cancelling = false;
+  private stopTask: Promise<void> | undefined;
 
   constructor(
     private readonly orm: MikroORM,
@@ -63,9 +76,41 @@ export class OutboxPublisher {
     }
   }
 
-  async stop(): Promise<void> {
+  quiesce(): void {
     this.stopped = true;
-    await Promise.allSettled(this.active);
+  }
+
+  stop(input: number | ShutdownOptions = {}): Promise<void> {
+    if (!this.stopTask) this.stopTask = this.drain(input);
+    return this.stopTask;
+  }
+
+  private async drain(input: number | ShutdownOptions): Promise<void> {
+    const options = normalizeShutdownOptions(input);
+    this.quiesce();
+    if (await waitForSettlement(this.active, options.timeoutMs, options.signal)) return;
+    this.cancelling = true;
+    const abandoned = [...this.deliveries];
+    for (const delivery of abandoned) {
+      delivery.stopHeartbeat();
+      delivery.abort.abort(new DOMException('Publisher shutting down', 'AbortError'));
+    }
+    if (options.cleanupMs === 0 || options.signal?.aborted || abandoned.length === 0) return;
+    // A blocked pool or row must not prevent shutdown. Failed cleanup leaves the
+    // finite lease to expire; it never changes published state or the event id.
+    await waitForSettlement([this.releaseOwnedLeases(abandoned)], options.cleanupMs, options.signal);
+  }
+
+  private async releaseOwnedLeases(deliveries: ActiveDelivery[]): Promise<void> {
+    await this.orm.em.fork().transactional(async em => {
+      await em.execute("select set_config('lock_timeout', '1000ms', true), set_config('statement_timeout', '2000ms', true)");
+      const rows = deliveries.map(() => '(?::uuid, ?::uuid)').join(', ');
+      const parameters = deliveries.flatMap(delivery => [delivery.id, delivery.token]);
+      await em.execute(`update dwp.outbox_messages as message
+        set lease_token = null, lease_until = null
+        from (values ${rows}) as owned(id, token)
+        where message.id = owned.id and message.lease_token = owned.token and message.published_at is null`, parameters);
+    });
   }
 
   private async publishBatch(): Promise<number> {
@@ -86,6 +131,7 @@ export class OutboxPublisher {
                 message.occurred_at, message.attempts, message.lease_token
     `, [this.batchSize, token, this.leaseMs]));
 
+    if (this.cancelling) return 0;
     const results = await Promise.allSettled(claimed.map((row) => this.publish(row)));
     const failure = results.find((result) => result.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
@@ -116,27 +162,37 @@ export class OutboxPublisher {
     const renew = (): Promise<boolean> => {
       if (renewal) return renewal;
       if (!owned) return Promise.resolve(false);
-      const pending = this.orm.em.fork().execute<{ id: string }[]>(`
+      const query = this.orm.em.fork().execute<{ id: string }[]>(`
         update dwp.outbox_messages
         set lease_until = clock_timestamp() + (? * interval '1 millisecond')
         where id = ? and lease_token = ? and published_at is null
           and lease_until > clock_timestamp()
         returning id
-      `, [this.leaseMs, row.id, row.lease_token]).then((updated) => {
-        owned = updated.length === 1;
+      `, [this.leaseMs, row.id, row.lease_token]);
+      const pending = (async () => {
+        try {
+          const finished = await waitForSettlement([query], this.leaseMs, abort.signal);
+          if (!finished) {
+            owned = false;
+          } else {
+            owned = (await query).length === 1 && !this.cancelling;
+          }
+        } catch {
+          owned = false;
+        }
         if (!owned) abort.abort();
         return owned;
-      }, () => {
-        owned = false;
-        abort.abort();
-        return false;
-      });
+      })();
       renewal = pending;
       void pending.then(() => { if (renewal === pending) renewal = undefined; });
       return pending;
     };
 
     const heartbeat = setInterval(() => { void renew(); }, Math.floor(this.leaseMs / 3));
+    const delivery: ActiveDelivery = {
+      id: row.id, token: row.lease_token, abort, stopHeartbeat: () => clearInterval(heartbeat),
+    };
+    this.deliveries.add(delivery);
     const finishHeartbeat = async (): Promise<void> => {
       clearInterval(heartbeat);
       if (renewal) await renewal;
@@ -144,22 +200,22 @@ export class OutboxPublisher {
 
     try {
       await this.options.beforeSend?.(message);
-      if (!await renew()) {
-        this.options.onLeaseLost?.(message);
+      if (this.cancelling || !await renew()) {
+        if (!this.cancelling) this.options.onLeaseLost?.(message);
         return false;
       }
-      await this.sqs.send(new SendMessageCommand({
+      await sqsCall(abortSignal => this.sqs.send(new SendMessageCommand({
         QueueUrl: this.queueUrl,
         MessageBody: JSON.stringify(message.payload),
         MessageAttributes: {
           eventId: { DataType: 'String', StringValue: message.id },
           eventType: { DataType: 'String', StringValue: message.eventType },
         },
-      }), { abortSignal: abort.signal });
+      }), { abortSignal }), { signal: abort.signal, timeoutMs: this.options.operationTimeoutMs });
       await this.options.afterSend?.(message);
       await finishHeartbeat();
-      if (!owned) {
-        this.options.onLeaseLost?.(message);
+      if (this.cancelling || !owned) {
+        if (!this.cancelling) this.options.onLeaseLost?.(message);
         return false;
       }
       const updated = await this.orm.em.fork().execute<{ id: string }[]>(`
@@ -173,8 +229,8 @@ export class OutboxPublisher {
       return updated.length === 1;
     } catch (error) {
       await finishHeartbeat();
-      if (!owned) {
-        this.options.onLeaseLost?.(message);
+      if (this.cancelling || !owned) {
+        if (!this.cancelling) this.options.onLeaseLost?.(message);
         return false;
       }
       const retry = OutboxMessage.rehydrate({
@@ -197,6 +253,7 @@ export class OutboxPublisher {
       return false;
     } finally {
       await finishHeartbeat();
+      this.deliveries.delete(delivery);
     }
   }
 }
