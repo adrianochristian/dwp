@@ -177,6 +177,48 @@ integration('durable out-of-order reference processing', () => {
     await assertConsistent(wallet.id);
   });
 
+  test('allows only one cross-kind reversal when queued references race with an HTTP retry', async () => {
+    const { wallet, command } = await fixture();
+    const bet = command('BET', '25.00');
+    const refund = command('REFUND', '25.00', bet.externalTransactionId);
+    const rollback = command('ROLLBACK', '25.00', bet.externalTransactionId);
+    const refundKey = crypto.randomUUID();
+    const rollbackKey = crypto.randomUUID();
+    const pendingRefund = await service.submit(refund, refundKey);
+    const pendingRollback = await service.submit(rollback, rollbackKey, {
+      consumerName: 'reversal-reference-test', messageId: crypto.randomUUID(),
+    });
+    expect(pendingRefund.status).toBe('PENDING_REFERENCE');
+    expect(pendingRollback.status).toBe('PENDING_REFERENCE');
+    await service.submit(bet, crypto.randomUUID());
+    await Promise.all([makeDue(pendingRefund.transactionId), makeDue(pendingRollback.transactionId)]);
+    const worker = new ReferenceWorker(orm, new WageringService(orm));
+    try {
+      await Promise.all([worker.runOnce(), service.submit(refund, refundKey)]);
+    } finally {
+      await worker.stop();
+    }
+    const results = await Promise.all([
+      queries.getTransaction(pendingRefund.transactionId), queries.getTransaction(pendingRollback.transactionId),
+    ]);
+    expect(results.map(result => result.status).sort()).toEqual(['PROCESSED', 'REJECTED']);
+    const rejected = results.find(result => result.status === 'REJECTED')!;
+    expect(rejected.failureCode).toBe('REVERSAL_ALREADY_PROCESSED');
+    expect((await service.getWallet(wallet.id)).balance).toEqual(wallet.balance);
+    expect((await service.getWallet(wallet.id)).version).toBe(3);
+    expect(await query(`select id from dwp.wallet_ledger_entries
+      where transaction_id in (?, ?)`, [pendingRefund.transactionId, pendingRollback.transactionId])).toHaveLength(1);
+    expect(await events(rejected.transactionId, 'WalletBalanceChanged')).toBe(0);
+    expect(await events(rejected.transactionId, 'WagerTransactionRejected')).toBe(1);
+    for (const [body, key, terminal] of [[refund, refundKey, results[0]!], [rollback, rollbackKey, results[1]!]] as const) {
+      expect(await service.submit(body, key)).toMatchObject({
+        transactionId: terminal.transactionId, status: terminal.status, balance: wallet.balance, idempotentReplay: true,
+        ...(terminal.failureCode ? { failureCode: terminal.failureCode } : {}),
+      });
+    }
+    await assertConsistent(wallet.id);
+  });
+
   test('rechecks the persisted due time when two workers select the same pending reference', async () => {
     const { wallet, command } = await fixture();
     const pending = await service.submit(command('REFUND', '25.00', crypto.randomUUID()), crypto.randomUUID());

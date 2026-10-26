@@ -6,6 +6,7 @@ import { createDatabase } from '../../dist/infrastructure/persistence/database.j
 import { Migration20261025000100 } from '../../dist/infrastructure/persistence/migrations/Migration20261025000100.js';
 import { Migration20261025000200 } from '../../dist/infrastructure/persistence/migrations/WageringSchema.js';
 import { Migration20261025000300 } from '../../dist/infrastructure/persistence/migrations/Migration20261025000300.js';
+import { Migration20261026000100 } from '../../dist/infrastructure/persistence/migrations/Migration20261026000100.js';
 import { WalletRecord, WalletRecordSchema } from '../../dist/infrastructure/persistence/records.js';
 
 const integration = process.env.DWP_INTEGRATION === '1' ? describe : describe.skip;
@@ -25,7 +26,7 @@ integration('database financial constraints', () => {
       entities: [WalletRecordSchema],
       extensions: [Migrator],
       migrations: {
-        migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300],
+        migrationsList: [Migration20261025000100, Migration20261025000200, Migration20261025000300, Migration20261026000100],
         snapshot: false,
         snapshotOnMigrate: false,
       },
@@ -177,7 +178,7 @@ integration('database financial constraints', () => {
     }
   });
 
-  test('allows one reversal per kind, rejects partial and mismatched references', async () => {
+  test('allows one successful reversal per reference, rejects partial and mismatched references', async () => {
     const walletId = crypto.randomUUID();
     const external = crypto.randomUUID();
     let bet = '';
@@ -207,15 +208,15 @@ integration('database financial constraints', () => {
       await entry(em, walletId, refund, '25', '75', '100', 3);
     });
     await expect(run(async em => { await transaction(em, walletId, 'REFUND', '25', crypto.randomUUID(), reference); })).rejects.toThrow();
-    await run(async em => {
+    await expect(run(async em => {
       const rollback = await transaction(em, walletId, 'ROLLBACK', '25', crypto.randomUUID(), reference);
       await em.execute('update dwp.wallets set balance_cents = 125, version = 4 where id = ?', [walletId]);
       await entry(em, walletId, rollback, '25', '100', '125', 4);
-    });
+    })).rejects.toMatchObject({ code: '23505' });
     const balances = await orm.em.getConnection().execute<{ balance_cents: string; ledger_balance: string }[]>(`
       select w.balance_cents, (select sum(case when direction='CREDIT' then amount_cents else -amount_cents end)
       from dwp.wallet_ledger_entries where wallet_id = w.id)::text as ledger_balance from dwp.wallets w where id = ?`, [walletId]);
-    expect(balances[0]).toEqual({ balance_cents: '125', ledger_balance: '125' });
+    expect(balances[0]).toEqual({ balance_cents: '100', ledger_balance: '100' });
   });
 
   test('reverses and reapplies all domain tables and constraints', async () => {

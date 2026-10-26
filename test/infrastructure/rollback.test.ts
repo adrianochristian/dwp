@@ -58,6 +58,16 @@ integration('ROLLBACK inverts a processed financial transaction', () => {
     return (await query<{ direction: string }>('select direction from dwp.wallet_ledger_entries where transaction_id = ?', [transactionId]))[0]?.direction;
   }
 
+  async function effects(walletId: string) {
+    const [row] = await query<{ ledger_entries: string; balance_events: string; all_events: string }>(`select
+      (select count(*)::text from dwp.wallet_ledger_entries where wallet_id = ?) as ledger_entries,
+      (select count(*)::text from dwp.outbox_messages where event_type = 'WalletBalanceChanged'
+        and payload->'data'->>'walletId' = ?) as balance_events,
+      (select count(*)::text from dwp.outbox_messages where payload->'data'->>'walletId' = ?) as all_events`,
+    [walletId, walletId, walletId]);
+    return row!;
+  }
+
   test('credits a reversed BET and keeps the original replay balance after later movement', async () => {
     const { wallet, command } = await fixture();
     const bet = command('BET', '25.00');
@@ -86,10 +96,13 @@ integration('ROLLBACK inverts a processed financial transaction', () => {
     const bet = second.command('BET', '25.00');
     await service.submit(bet, crypto.randomUUID());
     const refund = second.command('REFUND', '25.00', bet.externalTransactionId);
-    await service.submit(refund, crypto.randomUUID());
+    const refunded = await service.submit(refund, crypto.randomUUID());
+    expect(refunded).toMatchObject({ status: 'PROCESSED', balance: { amount: '100.00', currency: 'BRL' } });
+    expect((await service.getWallet(second.wallet.id)).version).toBe(3);
     const refundRollback = await service.submit(second.command('ROLLBACK', '25.00', refund.externalTransactionId), crypto.randomUUID());
     expect(refundRollback).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00', currency: 'BRL' } });
     expect(await ledgerDirection(refundRollback.transactionId)).toBe('DEBIT');
+    expect((await service.getWallet(second.wallet.id)).version).toBe(4);
     await assertConsistent(second.wallet.id);
   });
 
@@ -127,16 +140,111 @@ integration('ROLLBACK inverts a processed financial transaction', () => {
     await assertConsistent(wallet.id);
   });
 
-  test('allows one REFUND and one ROLLBACK to reverse the same BET by their distinct kinds', async () => {
+  test('rejects ROLLBACK after REFUND of the same BET and replays the original rejection without effects', async () => {
     const { wallet, command } = await fixture();
     const bet = command('BET', '25.00');
     await service.submit(bet, crypto.randomUUID());
+    const refunded = await service.submit(command('REFUND', '25.00', bet.externalTransactionId), crypto.randomUUID());
+    expect(refunded).toMatchObject({ status: 'PROCESSED', balance: wallet.balance });
+    const before = await service.getWallet(wallet.id);
+    const initialEffects = await effects(wallet.id);
+    const rollback = command('ROLLBACK', '25.00', bet.externalTransactionId);
+    const key = crypto.randomUUID();
+    const rejected = await service.submit(rollback, key);
+    expect(rejected).toMatchObject({
+      status: 'REJECTED', failureCode: 'REVERSAL_ALREADY_PROCESSED',
+      balance: { amount: '100.00', currency: 'BRL' }, idempotentReplay: false,
+    });
+    expect(await service.getWallet(wallet.id)).toEqual(before);
+    expect(await ledgerDirection(rejected.transactionId)).toBeUndefined();
+    const rejectedEffects = await effects(wallet.id);
+    expect(rejectedEffects.ledger_entries).toBe(initialEffects.ledger_entries);
+    expect(rejectedEffects.balance_events).toBe(initialEffects.balance_events);
+    expect(await query<{ event_type: string }>(`select event_type from dwp.outbox_messages
+      where payload->'data'->>'transactionId' = ?`, [rejected.transactionId]))
+      .toEqual([{ event_type: 'WagerTransactionRejected' }]);
+
+    await service.submit(command('BET', '10.00'), crypto.randomUUID());
+    const beforeReplay = await effects(wallet.id);
+    expect(await service.submit(rollback, key)).toEqual({ ...rejected, idempotentReplay: true });
+    expect((await service.getWallet(wallet.id)).balance.amount).toBe('90.00');
+    expect(await effects(wallet.id)).toEqual(beforeReplay);
+    await assertConsistent(wallet.id);
+  });
+
+  test('serializes REFUND versus ROLLBACK of the same BET into one credit and one persistent rejection', async () => {
+    const { wallet, command } = await fixture();
+    const bet = command('BET', '25.00');
+    const original = await service.submit(bet, crypto.randomUUID());
+    const refund = command('REFUND', '25.00', bet.externalTransactionId);
+    const rollback = command('ROLLBACK', '25.00', bet.externalTransactionId);
+    const keys = [crypto.randomUUID(), crypto.randomUUID()] as const;
     const results = await Promise.all([
-      service.submit(command('REFUND', '25.00', bet.externalTransactionId), crypto.randomUUID()),
-      service.submit(command('ROLLBACK', '25.00', bet.externalTransactionId), crypto.randomUUID()),
+      service.submit(refund, keys[0]), service.submit(rollback, keys[1]),
     ]);
-    expect(results.every(result => result.status === 'PROCESSED')).toBe(true);
-    expect((await service.getWallet(wallet.id)).balance.amount).toBe('125.00');
+    expect(results.map(result => result.status).sort()).toEqual(['PROCESSED', 'REJECTED']);
+    const rejected = results.find(result => result.status === 'REJECTED')!;
+    expect(rejected).toMatchObject({ failureCode: 'REVERSAL_ALREADY_PROCESSED', balance: wallet.balance });
+    expect((await service.getWallet(wallet.id))).toMatchObject({ balance: wallet.balance, version: 3 });
+    expect(await query(`select id from dwp.wager_transactions where reference_transaction_id = ?
+      and kind in ('REFUND','ROLLBACK') and status = 'PROCESSED'`, [original.transactionId])).toHaveLength(1);
+    expect(await query(`select id from dwp.wallet_ledger_entries where transaction_id in (?, ?)`,
+      results.map(result => result.transactionId))).toHaveLength(1);
+    expect(await ledgerDirection(rejected.transactionId)).toBeUndefined();
+    expect(await query<{ event_type: string }>(`select event_type from dwp.outbox_messages
+      where payload->'data'->>'transactionId' = ?`, [rejected.transactionId]))
+      .toEqual([{ event_type: 'WagerTransactionRejected' }]);
+    expect(await effects(wallet.id)).toMatchObject({ ledger_entries: '3', balance_events: '3' });
+
+    await service.submit(command('BET', '10.00'), crypto.randomUUID());
+    const beforeReplay = await effects(wallet.id);
+    expect(await service.submit(refund, keys[0])).toEqual({ ...results[0]!, idempotentReplay: true });
+    expect(await service.submit(rollback, keys[1])).toEqual({ ...results[1]!, idempotentReplay: true });
+    expect((await service.getWallet(wallet.id)).balance.amount).toBe('90.00');
+    expect(await effects(wallet.id)).toEqual(beforeReplay);
+    await assertConsistent(wallet.id);
+  });
+
+  test('WIN and LOSS references do not block the first reversal of their BET', async () => {
+    const { wallet, command } = await fixture();
+    const bet = command('BET', '25.00');
+    await service.submit(bet, crypto.randomUUID());
+    const win = await service.submit(command('WIN', '10.00', bet.externalTransactionId), crypto.randomUUID());
+    const loss = await service.submit(command('LOSS', '0.00', bet.externalTransactionId), crypto.randomUUID());
+    expect(win.status).toBe('PROCESSED');
+    expect(loss.status).toBe('PROCESSED');
+    const rollback = await service.submit(command('ROLLBACK', '25.00', bet.externalTransactionId), crypto.randomUUID());
+    expect(rollback).toMatchObject({ status: 'PROCESSED', balance: { amount: '110.00', currency: 'BRL' } });
+    expect(await ledgerDirection(rollback.transactionId)).toBe('CREDIT');
+    await assertConsistent(wallet.id);
+  });
+
+  test('rolling back a REFUND does not make its original BET eligible for another reversal', async () => {
+    const { wallet, command } = await fixture();
+    const bet = command('BET', '25.00');
+    const betResult = await service.submit(bet, crypto.randomUUID());
+    const refund = command('REFUND', '25.00', bet.externalTransactionId);
+    expect((await service.submit(refund, crypto.randomUUID())).balance.amount).toBe('100.00');
+    const refundRollback = await service.submit(command('ROLLBACK', '25.00', refund.externalTransactionId), crypto.randomUUID());
+    expect(refundRollback).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00', currency: 'BRL' } });
+    const before = await service.getWallet(wallet.id);
+    const initialEffects = await effects(wallet.id);
+    for (const kind of ['REFUND', 'ROLLBACK']) {
+      const body = command(kind, '25.00', bet.externalTransactionId);
+      const key = crypto.randomUUID();
+      const rejected = await service.submit(body, key);
+      expect(rejected).toMatchObject({
+        status: 'REJECTED', failureCode: 'REVERSAL_ALREADY_PROCESSED', balance: before.balance,
+      });
+      expect(await ledgerDirection(rejected.transactionId)).toBeUndefined();
+      expect(await service.submit(body, key)).toEqual({ ...rejected, idempotentReplay: true });
+    }
+    expect(await service.getWallet(wallet.id)).toEqual(before);
+    const after = await effects(wallet.id);
+    expect(after.ledger_entries).toBe(initialEffects.ledger_entries);
+    expect(after.balance_events).toBe(initialEffects.balance_events);
+    expect(await query(`select id from dwp.wager_transactions where reference_transaction_id = ?
+      and kind in ('REFUND','ROLLBACK') and status = 'PROCESSED'`, [betResult.transactionId])).toHaveLength(1);
     await assertConsistent(wallet.id);
   });
 

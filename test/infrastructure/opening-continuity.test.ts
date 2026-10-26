@@ -115,7 +115,7 @@ integration('opening ledger successor continuity', () => {
       return row!;
     };
     expect(await present()).toEqual({ trigger_exists: true, truncate_guard_exists: true, function_exists: true, wallets_exist: true });
-    await orm.migrator.down();
+    await orm.migrator.down({ to: 'Migration20261025000200' });
     expect(await present()).toEqual({ trigger_exists: false, truncate_guard_exists: false, function_exists: false, wallets_exist: true });
     expect(await balance(walletId)).toEqual(expectedBalance);
     await orm.migrator.up();

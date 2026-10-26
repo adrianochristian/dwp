@@ -206,8 +206,8 @@ export class WageringService {
       } else {
         if (transaction.requiresReference() && reference) {
           const existing = await em.execute<{ id: string }[]>(`select id from dwp.wager_transactions
-            where reference_transaction_id = ? and kind = ? and status = 'PROCESSED' limit 1`, [reference.id, transaction.kind]);
-          if (existing.length > 0) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference was already reversed by this operation kind');
+            where reference_transaction_id = ? and kind in ('REFUND','ROLLBACK') and status = 'PROCESSED' limit 1`, [reference.id]);
+          if (existing.length > 0) throw new DomainError('REVERSAL_ALREADY_PROCESSED', 'The reference already has a processed reversal');
         }
         movement = transaction.ledgerDirectionFor(reference) === LedgerDirection.Debit
           ? wallet.debit(transaction.money, at)

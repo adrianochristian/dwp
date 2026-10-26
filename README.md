@@ -150,7 +150,7 @@ O ledger retorna `{ "walletId": "...", "entries": [], "nextCursor": null }`, com
 | `REFUND` | Crédito integral do valor da aposta. | Obrigatória, para `BET` processada. |
 | `ROLLBACK` | Movimentação inversa à referência; rejeita saldo negativo. | Obrigatória, para `BET`, `WIN` ou `REFUND` processada. |
 
-Informe `referenceExternalTransactionId` para referenciar o ID do provedor. Referências precisam identificar o mesmo provedor, jogador, wallet, moeda e rodada. Referências ausentes ou pendentes produzem `PENDING_REFERENCE`; o worker reprocessa com backoff de `1` a `60` segundos e TTL de `24` horas desde a criação persistida. `OPENING` é interno. Operações financeiras exigem valor positivo; entradas monetárias devem ter exatamente duas casas decimais e a aplicação opera em `BRL`.
+Informe `referenceExternalTransactionId` para referenciar o ID do provedor. Referências precisam identificar o mesmo provedor, jogador, wallet, moeda e rodada. Cada referência admite uma única reversão processada, somando REFUND e ROLLBACK; uma segunda recebe `REVERSAL_ALREADY_PROCESSED`. Para desfazer um REFUND, envie ROLLBACK referenciando o próprio REFUND. Referências ausentes ou pendentes produzem `PENDING_REFERENCE`; o worker reprocessa com backoff de `1` a `60` segundos e TTL de `24` horas desde a criação persistida. `OPENING` é interno. Operações financeiras exigem valor positivo; entradas monetárias devem ter exatamente duas casas decimais e a aplicação opera em `BRL`.
 
 | HTTP | Significado |
 | --- | --- |
@@ -197,7 +197,7 @@ O publisher entrega em `wager-events` os envelopes `WagerTransactionProcessed`, 
 
 ## Testes
 
-As contagens da entrega são **59 testes de unidade/bootstrap**, **110 de integração** e **4 de autenticação**. Os testes de integração usam PostgreSQL e MiniStack reais, bancos e filas isolados, concorrência em três processos, `SIGKILL`, redelivery, publishers concorrentes e indisponibilidade de dependências. O papel de banco do Compose pode criar bancos temporários, como exigem esses testes.
+As contagens da entrega são **59 testes de unidade/bootstrap**, **119 de integração** e **4 de autenticação**. Os testes de integração usam PostgreSQL e MiniStack reais, bancos e filas isolados, concorrência em três processos, `SIGKILL`, redelivery, publishers concorrentes e indisponibilidade de dependências. O papel de banco do Compose pode criar bancos temporários, como exigem esses testes.
 
 ```bash
 bun run build

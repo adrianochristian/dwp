@@ -58,7 +58,7 @@ O schema aplica, além das validações da aplicação:
 
 - Unicidade de wallet por jogador/moeda, idempotency key global e identidade `(providerId, externalTransactionId)`.
 - Um lançamento por transação/wallet e uma entrada por versão da wallet.
-- Uma reversão processada por `(referenceTransactionId, kind)`.
+- Uma única reversão processada por `referenceTransactionId`, independentemente de ser REFUND ou ROLLBACK.
 - Inbox única por consumidor/mensagem; outbox identificada pelo `eventId` persistido.
 - Saldos não negativos, valores financeiros exatos, aritmética dos lançamentos e relações por FK.
 - Proibição de `UPDATE`, `DELETE` e `TRUNCATE` no ledger e de alteração de transações terminais.
@@ -93,7 +93,9 @@ Uma aceitação pendente não congela o processamento financeiro: retry HTTP pod
 
 Quando informada, a referência é resolvida por provedor e id externo, e precisa corresponder a jogador, wallet, moeda e rodada. Referências ausentes ou pendentes deixam a operação em `PENDING_REFERENCE`. Referência rejeitada ou permanentemente falha causa uma rejeição específica. Autorreferência é contrato inválido.
 
-Não existe exclusividade adicional entre WIN e LOSS da mesma BET. A unicidade de reversão é por referência **e tipo**, seguindo a regra literal do desafio: uma BET pode ter um REFUND e um ROLLBACK processados. Dois REFUNDs ou dois ROLLBACKs da mesma referência não podem ser processados. A aplicação verifica isso sob lock da wallet antes dos efeitos, e o índice único parcial reforça a garantia no commit.
+Não existe exclusividade adicional entre WIN e LOSS da mesma BET. Uma referência só pode ter **uma reversão processada**, considerando REFUND e ROLLBACK em conjunto. Depois de BET de `25.00` e REFUND, um ROLLBACK que ainda referencia a BET recebe `REVERSAL_ALREADY_PROCESSED`, sem novo crédito. Para desfazer o REFUND, o ROLLBACK deve referenciar o próprio REFUND e debitar seu valor; isso não torna a BET original reversível novamente. WIN e LOSS que referenciam a BET não contam como reversões, e tentativas rejeitadas não consomem a referência. A aplicação verifica a exclusividade sob lock da wallet antes dos efeitos, e o índice único parcial em `reference_transaction_id` reforça a garantia no banco.
+
+A migration `Migration20261026000100` substitui o índice de reversão por referência/tipo sem reescrever transações ou ledger. Se o banco já contiver REFUND e ROLLBACK processados sobre a mesma referência, a criação do índice falha e a migration inteira é desfeita, preservando dados e índice anterior. Esse histórico exige auditoria financeira e uma estratégia explícita de migração; não há reparo automático. A atualização deve ser coordenada para retirar os writers com a regra antiga antes de retomar o processamento.
 
 Reversão parcial é rejeitada. Um rollback que precisaria debitar mais que o saldo disponível recebe `REVERSAL_INSUFFICIENT_FUNDS`, distinto de `INSUFFICIENT_FUNDS` de BET. A rejeição permanece persistida sem ledger ou mudança de versão.
 
@@ -171,7 +173,7 @@ Autenticação só é desativada quando `AUTH_ENABLED=false` está explícito pa
 
 ## Evidências e limites
 
-As execuções de validação da entrega registraram 59 testes unitários, 110 testes de integração e 4 testes de autenticação. A suíte cobre parsing/limites, estados terminais, regras financeiras, SQL direto e migrations, 50 submissões paralelas da mesma aposta, duas apostas de `80.00` disputando `100.00`, wallets independentes e três processos reais.
+As execuções de validação da entrega registraram 59 testes unitários, 119 testes de integração e 4 testes de autenticação. A suíte cobre parsing/limites, estados terminais, regras financeiras, SQL direto e migrations, 50 submissões paralelas da mesma aposta, duas apostas de `80.00` disputando `100.00`, wallets independentes e três processos reais. As regressões de reversão verificam REFUND seguido de ROLLBACK e a ordem inversa, a disputa concorrente entre os tipos, reprocessamento de referências pendentes, replay da rejeição, ROLLBACK do próprio REFUND e a proteção do índice por SQL direto. A migration de unicidade é testada em ida/volta e com histórico incompatível, sem alteração de dados financeiros.
 
 Os cenários de falha incluem rollback antes do commit, redelivery após commit antes do ack, dois publishers, retomada de leases, indisponibilidade de PostgreSQL/SQS, referências fora de ordem, expiração e disputa de reprocessamento com HTTP. Os testes de crash usam processos separados e `SIGKILL` em pontos antes/depois do envio e depois do commit antes do ack. Os cenários financeiros conferem reconstrução do saldo pelo ledger, ausência de efeitos duplicados e não negatividade.
 

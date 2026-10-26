@@ -79,6 +79,100 @@ integration('full BET refunds', () => {
     await assertConsistent(wallet.id);
   });
 
+  test('rejects REFUND after ROLLBACK already restored the BET and replays the rejection snapshot', async () => {
+    const { wallet, bet, betResult, refund, key } = await fixture();
+    expect(betResult).toMatchObject({ status: 'PROCESSED', balance: { amount: '75.00', currency: 'BRL' } });
+    const rollback = { ...refund, kind: 'ROLLBACK', externalTransactionId: crypto.randomUUID() };
+    const reversed = await service.submit(rollback, crypto.randomUUID());
+    expect(reversed).toMatchObject({ status: 'PROCESSED', balance: { amount: '100.00', currency: 'BRL' } });
+    const beforeRefund = await service.getWallet(wallet.id);
+    expect(beforeRefund.version).toBe(3);
+    const balanceEventsBefore = await query<{ id: string }>(
+      "select id from dwp.outbox_messages where event_type = 'WalletBalanceChanged' and aggregate_id = ? order by id", [wallet.id],
+    );
+
+    const rejected = await service.submit(refund, key);
+    expect(rejected).toMatchObject({
+      status: 'REJECTED', failureCode: 'REVERSAL_ALREADY_PROCESSED',
+      balance: { amount: '100.00', currency: 'BRL' }, idempotentReplay: false,
+    });
+    expect(await service.getWallet(wallet.id)).toEqual(beforeRefund);
+    expect(await query('select id from dwp.wallet_ledger_entries where transaction_id = ?', [rejected.transactionId])).toHaveLength(0);
+    expect(await query("select event_type from dwp.outbox_messages where payload->'data'->>'transactionId' = ?", [rejected.transactionId]))
+      .toEqual([{ event_type: 'WagerTransactionRejected' }]);
+    expect(await query("select id from dwp.outbox_messages where event_type = 'WalletBalanceChanged' and payload->'data'->>'transactionId' = ?",
+      [rejected.transactionId])).toHaveLength(0);
+    expect(await query<{ id: string }>(
+      "select id from dwp.outbox_messages where event_type = 'WalletBalanceChanged' and aggregate_id = ? order by id", [wallet.id],
+    )).toEqual(balanceEventsBefore);
+    await assertConsistent(wallet.id);
+
+    await service.submit({ ...bet, externalTransactionId: crypto.randomUUID(), money: { amount: '10.00', currency: 'BRL' } }, crypto.randomUUID());
+    const beforeReplay = await service.getWallet(wallet.id);
+    expect(beforeReplay).toMatchObject({ balance: { amount: '90.00', currency: 'BRL' }, version: 4 });
+    const eventsBeforeReplay = await query<{ id: string }>(
+      "select id from dwp.outbox_messages where payload->'data'->>'walletId' = ? order by id", [wallet.id],
+    );
+    const ledgerBeforeReplay = await query<{ id: string }>(
+      'select id from dwp.wallet_ledger_entries where wallet_id = ? order by id', [wallet.id],
+    );
+    expect(await service.submit(refund, key)).toEqual({ ...rejected, idempotentReplay: true });
+    expect(await service.getWallet(wallet.id)).toEqual(beforeReplay);
+    expect(await query<{ id: string }>(
+      "select id from dwp.outbox_messages where payload->'data'->>'walletId' = ? order by id", [wallet.id],
+    )).toEqual(eventsBeforeReplay);
+    expect(await query<{ id: string }>(
+      'select id from dwp.wallet_ledger_entries where wallet_id = ? order by id', [wallet.id],
+    )).toEqual(ledgerBeforeReplay);
+    await assertConsistent(wallet.id);
+  });
+
+  test('a rejected partial ROLLBACK does not consume the first full REFUND of the BET', async () => {
+    const { wallet, betResult, refund, key } = await fixture();
+    const partialRollback = {
+      ...refund, kind: 'ROLLBACK', externalTransactionId: crypto.randomUUID(), money: { amount: '24.00', currency: 'BRL' },
+    };
+    const partialKey = crypto.randomUUID();
+    const beforeRejection = await service.getWallet(wallet.id);
+    expect(beforeRejection).toMatchObject({ balance: { amount: '75.00', currency: 'BRL' }, version: 2 });
+    const rejected = await service.submit(partialRollback, partialKey);
+    expect(rejected).toMatchObject({
+      status: 'REJECTED', failureCode: 'REFERENCE_AMOUNT_MISMATCH',
+      balance: { amount: '75.00', currency: 'BRL' }, idempotentReplay: false,
+    });
+    expect(await service.getWallet(wallet.id)).toEqual(beforeRejection);
+    expect(await query('select id from dwp.wallet_ledger_entries where transaction_id = ?', [rejected.transactionId])).toHaveLength(0);
+    expect(await query("select event_type from dwp.outbox_messages where payload->'data'->>'transactionId' = ?", [rejected.transactionId]))
+      .toEqual([{ event_type: 'WagerTransactionRejected' }]);
+    expect(await query("select id from dwp.outbox_messages where event_type = 'WalletBalanceChanged' and payload->'data'->>'transactionId' = ?",
+      [rejected.transactionId])).toHaveLength(0);
+    await assertConsistent(wallet.id);
+
+    const processed = await service.submit(refund, key);
+    expect(processed).toMatchObject({ status: 'PROCESSED', balance: { amount: '100.00', currency: 'BRL' }, idempotentReplay: false });
+    const afterRefund = await service.getWallet(wallet.id);
+    expect(afterRefund).toMatchObject({ balance: { amount: '100.00', currency: 'BRL' }, version: 3 });
+    expect(await query("select kind from dwp.wager_transactions where reference_transaction_id = ? and status = 'PROCESSED' and kind in ('REFUND', 'ROLLBACK')",
+      [betResult!.transactionId])).toEqual([{ kind: 'REFUND' }]);
+    expect(await query('select direction, amount_cents::text from dwp.wallet_ledger_entries where transaction_id = ?', [processed.transactionId]))
+      .toEqual([{ direction: 'CREDIT', amount_cents: '2500' }]);
+    const eventsBeforeReplay = await query<{ id: string }>(
+      "select id from dwp.outbox_messages where payload->'data'->>'walletId' = ? order by id", [wallet.id],
+    );
+    const ledgerBeforeReplay = await query<{ id: string }>(
+      'select id from dwp.wallet_ledger_entries where wallet_id = ? order by id', [wallet.id],
+    );
+    expect(await service.submit(partialRollback, partialKey)).toEqual({ ...rejected, idempotentReplay: true });
+    expect(await service.getWallet(wallet.id)).toEqual(afterRefund);
+    expect(await query<{ id: string }>(
+      "select id from dwp.outbox_messages where payload->'data'->>'walletId' = ? order by id", [wallet.id],
+    )).toEqual(eventsBeforeReplay);
+    expect(await query<{ id: string }>(
+      'select id from dwp.wallet_ledger_entries where wallet_id = ? order by id', [wallet.id],
+    )).toEqual(ledgerBeforeReplay);
+    await assertConsistent(wallet.id);
+  });
+
   test('waits when delivered before BET and applies under the original transaction identity', async () => {
     const { wallet, bet, refund, key } = await fixture('100.00', '25.00', false);
     const pending = await service.submit(refund, key);
