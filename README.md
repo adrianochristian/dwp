@@ -50,6 +50,7 @@ curl --fail-with-body http://127.0.0.1:3000/metrics
 | `PORT` | `3000` | Porta HTTP da API. |
 | `WORKER_ROLE` | `all` | `all`, `consumer`, `publisher` ou `reference`. |
 | `WORKER_METRICS_PORT` | `0` | Porta local dos endpoints operacionais do worker; `0` escolhe uma porta livre. |
+| `OUTBOX_BATCH_SIZE` | `10` | Lote do publisher, de `1` a `100`; worker e carga usam a mesma configuração. |
 | `AUTH_ENABLED` | `false` no `.env.example` | Desativação explícita para desenvolvimento; a configuração autenticada está abaixo. |
 
 Os defaults de conexão do código coincidem com os serviços do Compose; os valores de autenticação SQS são fictícios. Para alterar as portas publicadas pelo Compose, ajuste `POSTGRES_PORT`/`SQS_PORT` e os respectivos URLs no `.env`.
@@ -62,7 +63,11 @@ bun run start:publisher
 WORKER_ROLE=reference bun run start:worker
 ```
 
-Cada worker abre `/health/live`, `/health/ready` e `/metrics` apenas em `127.0.0.1`. A linha JSON `worker_started` informa `metricsAddress`; esses endpoints locais do worker não usam autenticação. Use portas distintas ao fixar `WORKER_METRICS_PORT`, por exemplo `WORKER_METRICS_PORT=3001 bun run start:worker`. `SIGINT` e `SIGTERM` iniciam a drenagem; o consumidor devolve a visibilidade de mensagens que não concluir no prazo de encerramento.
+Cada worker abre `/health/live`, `/health/ready` e `/metrics` apenas em `127.0.0.1`. A linha JSON `worker_started` informa `metricsAddress` e a configuração efetiva do publisher; esses endpoints locais do worker não usam autenticação. Use portas distintas ao fixar `WORKER_METRICS_PORT`, por exemplo `WORKER_METRICS_PORT=3001 bun run start:worker`.
+
+`SIGINT` e `SIGTERM` interrompem novas buscas e iniciam uma drenagem paralela de até **10 segundos**. A liberação de visibilidade/leases é tentada com orçamento de até **3 segundos**, dentro da janela restante de cleanup. O limite total é **15 segundos**, incluindo fechamento de conexões; se o encerramento ficar bloqueado, o watchdog registra `SHUTDOWN_DEADLINE_EXCEEDED` e termina com código não zero. Trabalho ainda pendente pode ser recuperado por redelivery ou expiração da lease.
+
+As chamadas SQS usam conexão de `3s`, timeout efetivo de `25s` por tentativa e orçamento total padrão de `30s`, incluindo retries e backoff. O SDK tenta no máximo três vezes; o orçamento total pode interromper as tentativas antes disso. O long polling permanece em `20s`. O publisher continua imediatamente após um lote produtivo, espera `250ms` quando não publica nada e `1s` após erro de ciclo.
 
 As filas são resolvidas pelo nome. `COMMAND_QUEUE_URL`, `DLQ_QUEUE_URL` e `EVENT_QUEUE_URL` permitem fornecer URLs explícitos ao worker quando necessário.
 
@@ -152,6 +157,8 @@ O ledger retorna `{ "walletId": "...", "entries": [], "nextCursor": null }`, com
 
 Informe `referenceExternalTransactionId` para referenciar o ID do provedor. Referências precisam identificar o mesmo provedor, jogador, wallet, moeda e rodada. Cada referência admite uma única reversão processada, somando REFUND e ROLLBACK; uma segunda recebe `REVERSAL_ALREADY_PROCESSED`. Para desfazer um REFUND, envie ROLLBACK referenciando o próprio REFUND. Referências ausentes ou pendentes produzem `PENDING_REFERENCE`; o worker reprocessa com backoff de `1` a `60` segundos e TTL de `24` horas desde a criação persistida. `OPENING` é interno. Operações financeiras exigem valor positivo; entradas monetárias devem ter exatamente duas casas decimais e a aplicação opera em `BRL`.
 
+Identificadores e idempotency keys preservam texto Unicode válido, inclusive emojis. Strings malformadas são rejeitadas antes do hash e da persistência; não há substituição ou normalização automática de identidades.
+
 | HTTP | Significado |
 | --- | --- |
 | `201` | Wallet criada. |
@@ -161,14 +168,21 @@ Informe `referenceExternalTransactionId` para referenciar o ID do provedor. Refe
 | `401` / `403` | Token ausente/inválido ou acesso não autorizado. |
 | `404` | Wallet ou transação não encontrada. |
 | `409` | Wallet duplicada ou conflito de idempotência/identidade externa. |
+| `413` | Payload acima do limite de 100 KB: `PAYLOAD_TOO_LARGE`. |
+| `415` | Charset ou content encoding não suportado: `UNSUPPORTED_MEDIA_TYPE`. |
 | `422` | Rejeição de negócio; consulte `failureCode`, como `INSUFFICIENT_FUNDS`. |
-| `503` | Infraestrutura indisponível, readiness falha ou transação terminal `FAILED` auditável. |
+| `500` | Erro inesperado de programação: `INTERNAL_ERROR`, sem detalhes internos. |
+| `503` | Infraestrutura indisponível, falha ao obter JWKS, readiness falha ou transação terminal `FAILED` auditável. |
 
 Falhas transitórias podem ser reenviadas com a mesma key. Em uma resposta persistida com `status: "FAILED"`, use o `failureCode` para tratamento operacional: esse estado é terminal. O mapa completo de falhas está em [ARCHITECTURE.md](ARCHITECTURE.md).
 
+Falhas de transporte, timeout ou resposta inválida do JWKS retornam `503 IDENTITY_PROVIDER_UNAVAILABLE`. Tokens inválidos continuam em `401 INVALID_ACCESS_TOKEN`; chaves públicas já disponíveis continuam sendo usadas enquanto o cache permanece válido, por até cinco minutos.
+
 ## Comandos SQS e eventos
 
-`bun run queues:init` cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e a fila padrão `wager-events`. Comandos usam o mesmo caso de uso da API e são deduplicados no PostgreSQL por `(consumerName, messageId)`; o ack ocorre após o commit. Falhas transitórias têm limite de cinco tentativas, e erros permanentes seguem para a DLQ.
+`bun run queues:init` cria `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e a fila padrão `wager-events`. Comandos usam o mesmo caso de uso da API e são deduplicados no PostgreSQL por `(consumerName, messageId)`; o ack ocorre após o commit. Falhas transitórias são reentregues com limite de cinco recebimentos, e erros permanentes seguem para a DLQ. Esse limite é separado das tentativas de transporte do SDK em cada chamada.
+
+Uma falha de ack é diagnosticada como `ACK_FAILED`, separada da falha de processamento. Retry/DLQ preservam os identificadores e o status já observado; uma dificuldade de confirmar a mensagem não transforma uma operação financeira confirmada em `FAILED`.
 
 Envelope de comando, com os IDs da wallet e do jogador criados anteriormente:
 
@@ -197,7 +211,7 @@ O publisher entrega em `wager-events` os envelopes `WagerTransactionProcessed`, 
 
 ## Testes
 
-As contagens da entrega são **59 testes de unidade/bootstrap**, **119 de integração** e **4 de autenticação**. Os testes de integração usam PostgreSQL e MiniStack reais, bancos e filas isolados, concorrência em três processos, `SIGKILL`, redelivery, publishers concorrentes e indisponibilidade de dependências. O papel de banco do Compose pode criar bancos temporários, como exigem esses testes.
+As contagens da entrega são **87 testes de unidade/bootstrap/contratos**, **159 de integração** e **4 de autenticação**, totalizando **250 testes aprovados**. Os testes de integração usam PostgreSQL e MiniStack reais, bancos e filas isolados, concorrência em três processos, `SIGKILL`, redelivery, publishers concorrentes, brokers silenciosos, consultas SQL bloqueadas e indisponibilidade de dependências. O papel de banco do Compose pode criar bancos temporários, como exigem esses testes.
 
 ```bash
 bun run build
@@ -207,6 +221,8 @@ bun run test:integration
 ```
 
 `bun run test` executa unidade/bootstrap com integrações desativadas. `bun run test:integration` habilita os cenários reais de `test/infrastructure`; mantenha PostgreSQL/SQS disponíveis. A autenticação tem comando próprio após o setup de Keycloak abaixo. A CI executa build, verificação de tipos, testes, integração PostgreSQL/SQS e autenticação com Keycloak.
+
+A integração inclui um modelo financeiro independente com `fast-check 4.10.2`: seeds `424242`, `424243` e `424244`, 30 sequências por seed e até 30 comandos por sequência. A execução registrada verificou **90 sequências e 1.491 comandos**, comparando respostas, snapshots, saldo, versão, ledger, hashes, inbox e eventos após cada passo. Falhas informam seed e contraexemplo reproduzível. O modelo não importa regras nem helpers de produção.
 
 Para a validação completa, execute os comandos acima e depois:
 
@@ -289,9 +305,11 @@ Com PostgreSQL e MiniStack disponíveis:
 bun run test:load
 ```
 
-O comando cria banco e fila isolados, inicia **três processos de API** e **dois publishers**, e remove esses recursos ao terminar. Executa os cenários `hot-wallet` e `independent-wallets`, cada um com concorrências `1`, `10` e `50`. Cada combinação tem **15 segundos de aquecimento** e **60 segundos de medição**, aproximadamente 7 minutos e 30 segundos mais setup e drenagem.
+O comando cria banco e fila isolados, inicia **três processos de API** e **dois processos reais de publisher**, e remove esses recursos ao terminar. Os publishers executam o entrypoint normal, com `OUTBOX_BATCH_SIZE=10` por padrão e a mesma política de espera do worker. Executa os cenários `hot-wallet` e `independent-wallets`, cada um com concorrências `1`, `10` e `50`. Cada combinação tem **15 segundos de aquecimento** e **60 segundos de medição**, aproximadamente 7 minutos e 30 segundos mais setup e drenagem.
 
-O relatório local `load-results.json` é ignorado pelo Git e inclui ambiente, throughput, p50/p95/p99, erros, conflitos, outbox lag, recursos dos processos e reconciliação final. A execução falha se processos morrerem, a reconciliação divergir ou a outbox não drenar. Consulte os resultados e sua interpretação em [ARCHITECTURE.md](ARCHITECTURE.md).
+O relatório local `load-results.json` é ignorado pelo Git e inclui ambiente, PIDs/configuração, throughput, p50/p95/p99, erros, conflitos, outbox lag, métricas de cada publisher, recursos dos processos e reconciliação final. A execução falha se processos morrerem, houver erros/replays inesperados no tráfego, faltarem efeitos financeiros, a reconciliação divergir ou a outbox não drenar no orçamento configurado, de `60s` por padrão. Publicações concluídas durante o desligamento não tornam bem-sucedida uma drenagem que já excedeu esse prazo. Consulte os resultados e sua interpretação em [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Os percentis e o throughput excluem o aquecimento. Seus contadores de requisições permanecem no relatório para conferir o total de apostas persistidas.
 
 `LOAD_WARMUP_SECONDS`, `LOAD_DURATION_SECONDS`, `LOAD_OUTBOX_DRAIN_SECONDS` e `LOAD_REPORT_PATH` permitem ajustar o experimento. Exemplo curto para verificar o funcionamento do runner:
 
@@ -300,6 +318,15 @@ LOAD_WARMUP_SECONDS=1 LOAD_DURATION_SECONDS=2 LOAD_REPORT_PATH=load-results-smok
 ```
 
 Execute a carga sem outras suítes ou cargas concorrentes para preservar a comparabilidade dos resultados.
+
+Para repetir três execuções completas, cada uma com seus próprios banco, fila e processos:
+
+```bash
+for load_run in 1 2 3
+do
+  LOAD_REPORT_PATH="load-results-${load_run}.json" bun run test:load
+done
+```
 
 ## Migrations e encerramento
 

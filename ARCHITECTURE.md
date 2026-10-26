@@ -10,7 +10,12 @@ flowchart LR
   C[Fila de comandos FIFO] --> W[Consumidor SQS]
   W --> U
   R[Worker de referências] --> U
-  U --> D[(PostgreSQL: wallets, transações, ledger, inbox, outbox)]
+  U --> T[WageringStorePort]
+  H --> Q[WageringQueries]
+  Q --> V[WageringReadPort]
+  T --> A[MikroOrmWageringStore]
+  V --> A
+  A --> D[(PostgreSQL: wallets, transações, ledger, inbox, outbox)]
   D --> P[Publishers da outbox]
   P --> E[Fila de eventos]
   K[Keycloak / JWKS] --> H
@@ -18,7 +23,9 @@ flowchart LR
 
 A API NestJS roda em processos Bun separados. `worker.ts` permite executar consumidor, publisher e referências juntos ou escolher um papel com `WORKER_ROLE`. Cada processo abre seu próprio pool PostgreSQL. Isso permite escalar os papéis separadamente; a unidade de concorrência financeira continua sendo a wallet.
 
-Os diretórios separam domínio, aplicação, HTTP, persistência, mensageria, autenticação e observabilidade. O domínio não importa NestJS nem MikroORM. O runtime compila TypeScript antes de executar para preservar metadata de decorators exigida pelo NestJS.
+Os diretórios separam domínio, aplicação, HTTP, persistência, mensageria, autenticação e observabilidade. O domínio e os casos de uso `WageringService`/`WageringQueries` não importam NestJS, MikroORM ou SQL. O serviço coordena as entidades por um port transacional específico; as consultas usam um port de leitura. O adapter `MikroOrmWageringStore` implementa ambos, e as factories de infraestrutura fazem a composição no HTTP, workers e testes. O runtime compila TypeScript antes de executar para preservar metadata de decorators exigida pelo NestJS.
+
+`ObservedWageringService` e `ObservedWageringQueries` envolvem os casos de uso por composição. Logs e métricas ficam nessa borda; falhas de diagnóstico não substituem um resultado confirmado nem o erro original de uma execução desfeita.
 
 ## Dinheiro e modelo de domínio
 
@@ -36,9 +43,9 @@ Toda wallet nasce na versão 1. Abertura positiva cria uma transação interna `
 
 ## Transação SQL e concorrência
 
-Cada execução usa `EntityManager.fork().transactional()`. O mapeamento MikroORM `WalletRecord` usa `BigIntType('bigint')`, e o agregado é reconstruído com `Money.fromMinorUnits`. O Unit of Work persiste a mudança da wallet. Inserts, buscas de idempotência, ledger, inbox, outbox e operações de lease usam SQL explícito pelo `EntityManager` da mesma transação.
+Cada comando usa `WageringStorePort.transaction()`. O adapter cria um `EntityManager.fork().transactional()` e um contexto próprio para as operações de inbox, transação, wallet, ledger e outbox. O port expõe operações específicas de persistência e lock; o caso de uso decide as transições e os eventos sem receber um `EntityManager` ou executor SQL. O hook de falha `beforeCommit`, usado pelos testes, roda no Unit of Work depois do callback e antes do commit.
 
-O caso de uso conhece MikroORM e o schema de persistência. Essa é uma escolha de simplicidade: as garantias de lock, unicidade e commit ficam visíveis em um único fluxo, sem uma camada de repositórios genéricos que apenas repita o SQL. O custo é maior acoplamento do orquestrador ao PostgreSQL/MikroORM. As regras financeiras permanecem nas classes de domínio.
+O mapeamento MikroORM `WalletRecord` usa `BigIntType('bigint')`, e o agregado é reconstruído com `Money.fromMinorUnits`. O Unit of Work mantém o registro da wallet carregado sob lock e persiste suas mudanças. Inserts, idempotência, ledger, inbox e outbox usam SQL explícito pelo mesmo `EntityManager`. As operações de lease do publisher têm suas próprias transações, posteriores ao commit financeiro.
 
 A ordem de aquisição dos locks é consistente:
 
@@ -61,7 +68,8 @@ O schema aplica, além das validações da aplicação:
 - Uma única reversão processada por `referenceTransactionId`, independentemente de ser REFUND ou ROLLBACK.
 - Inbox única por consumidor/mensagem; outbox identificada pelo `eventId` persistido.
 - Saldos não negativos, valores financeiros exatos, aritmética dos lançamentos e relações por FK.
-- Proibição de `UPDATE`, `DELETE` e `TRUNCATE` no ledger e de alteração de transações terminais.
+- Proibição de `UPDATE`, `DELETE` e `TRUNCATE` no ledger; proibição de alteração ou exclusão de transações terminais.
+- Imutabilidade dos campos de negócio e de `created_at` da transação, inclusive enquanto ela aguarda referência.
 
 Triggers diferidos conferem a correspondência entre transação processada e ledger, direção, valor, identidade da wallet e referência, continuidade entre versões e igualdade entre o último saldo do ledger e o saldo materializado. Essas verificações usam buscas indexadas pela transação ou pela versão anterior/mais recente da wallet. O processamento de cada aposta não soma o histórico inteiro. Um trigger diferido adicional verifica o sucessor da abertura: ele impede inserir uma abertura retroativa na versão 1 depois de uma wallet zerada já ter recebido seu primeiro movimento na versão 2. Abertura e movimento seguinte na mesma transação SQL continuam permitidos quando os saldos são contíguos. O bloqueio de `TRUNCATE` também protege a exclusão em massa do ledger.
 
@@ -69,11 +77,15 @@ A FK da transação exige que a wallet exista. A identidade completa de jogador/
 
 Migrations são versionadas e reversíveis. Os testes executam ida/volta e tentam violações diretamente por SQL, incluindo mutação do ledger e mudanças de saldo sem lançamento correspondente.
 
+Há cinco migrations. A `Migration20261026000200` protege a identidade da operação — provedor, id externo, key, hash, wallet, jogador, rodada, jogo, tipo, valor, moeda e referência externa — e sua criação persistida. Também bloqueia `DELETE` de `PROCESSED`, `REJECTED` e `FAILED`. Assim, uma exclusão SQL não pode apagar uma rejeição terminal e permitir que o mesmo envio seja processado depois com outro saldo. Status, resultado e agenda de retry continuam atualizáveis pelas transições permitidas enquanto a operação não é terminal.
+
 ## Idempotência e resposta original
 
 O header `Idempotency-Key` é obrigatório no HTTP e é a fonte da verdade. Na fila, o consumidor fornece ao mesmo caso de uso a key presente em `data.idempotencyKey`.
 
 O hash é SHA-256 de JSON canônico: chaves de objetos são ordenadas recursivamente, e a ordem de arrays é preservada. O subconjunto de negócio contém provedor, identidade externa, jogador, wallet, rodada, jogo, tipo, dinheiro normalizado e referência externa quando informada. Header, envelope SQS e outros metadados de transporte não entram nesse hash.
+
+Identificadores e keys com sequências UTF-16 malformadas são rejeitados antes do hash e da persistência. Emojis e pares de surrogates válidos são preservados. Formas Unicode composta e decomposta permanecem identidades distintas; não há normalização implícita que altere os ids do provedor no percurso até o PostgreSQL.
 
 O insert usa `ON CONFLICT DO NOTHING`, e a execução consulta e bloqueia a linha da key. Payload divergente na mesma key resulta em `IDEMPOTENCY_CONFLICT`. Reutilizar a identidade externa do provedor com outra key resulta em `EXTERNAL_IDENTITY_CONFLICT`. Nenhum desses casos é tratado como replay.
 
@@ -114,20 +126,26 @@ O TTL é de 24 horas desde `created_at`, fornecido pelo banco. Tanto HTTP quanto
 | `401` / `403` | Token inválido ou escopo/role insuficiente. |
 | `404` | Wallet ou transação inexistente. |
 | `409` | Identidade de wallet, idempotência, identidade externa ou inbox conflitante. |
+| `413` | Corpo da requisição excede o tamanho permitido. |
+| `415` | Charset ou codificação do corpo não suportado. |
 | `422` | Rejeição financeira ou de referência, incluindo replay rejeitado. |
-| `503` | Infraestrutura indisponível; também é usado para um resultado terminal `FAILED`, identificado pelo corpo com `status` e `failureCode`. |
+| `500` | Erro de programação, invariante violada ou falha interna não reconhecida como transitória. |
+| `503` | Falha transitória reconhecida de infraestrutura, incluindo acesso ao JWKS; também é usado para um resultado terminal `FAILED`, identificado pelo corpo com `status` e `failureCode`. |
+
+`ApplicationError` carrega categoria, código, mensagem e causa, sem status HTTP. O filtro da borda traduz as categorias para HTTP e distingue falhas reconhecidas de conexão, timeout e lock de erros internos. JSON malformado recebe `400`; tamanho, charset e codificação são tratados nos respectivos códigos acima. SQL, mensagens do driver e causas internas não são serializados na resposta.
 
 As respostas de erro de contrato/infraestrutura usam `code` e `message`. Resultados financeiros rejeitados ou falhos usam `transactionId`, `status`, `balance`, `failureCode` e `idempotentReplay`. O cliente deve inspecionar esse resultado terminal antes de decidir reenviar; repetir uma operação `FAILED` não reabre seu estado.
 
 | Grupo | Códigos relevantes |
 | --- | --- |
-| Contrato | `INVALID_REQUEST`, `INVALID_MONEY`, `INVALID_CURRENCY`, `UNSUPPORTED_CURRENCY`, `INVALID_TRANSACTION_KIND`, `INVALID_TRANSACTION_AMOUNT`, `INVALID_REFERENCE`, `REFERENCE_REQUIRED`, `INVALID_PROVIDER`, `INVALID_CURSOR`. |
+| Contrato | `INVALID_REQUEST`, `INVALID_MONEY`, `INVALID_CURRENCY`, `UNSUPPORTED_CURRENCY`, `INVALID_TRANSACTION_KIND`, `INVALID_TRANSACTION_AMOUNT`, `INVALID_REFERENCE`, `REFERENCE_REQUIRED`, `INVALID_PROVIDER`, `INVALID_CURSOR`, `PAYLOAD_TOO_LARGE`, `UNSUPPORTED_MEDIA_TYPE`. |
 | Identidade/conflito | `WALLET_ALREADY_EXISTS`, `IDEMPOTENCY_CONFLICT`, `EXTERNAL_IDENTITY_CONFLICT`, `INBOX_MESSAGE_CONFLICT`. |
 | Saldo/modelo | `INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `CURRENCY_MISMATCH`, `WALLET_PLAYER_MISMATCH`, `MONEY_OVERFLOW`, `WALLET_VERSION_OVERFLOW`. |
 | Referência | `REFERENCE_MISMATCH`, `REFERENCE_REJECTED`, `REFERENCE_FAILED`, `INVALID_REFERENCE_KIND`, `REFERENCE_AMOUNT_MISMATCH`, `REVERSAL_ALREADY_PROCESSED`, `REFERENCE_EXPIRED`. |
-| Recursos/infraestrutura | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `INFRASTRUCTURE_UNAVAILABLE`, `DEPENDENCIES_UNAVAILABLE`. |
+| Recursos/infraestrutura | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `INFRASTRUCTURE_UNAVAILABLE`, `DEPENDENCIES_UNAVAILABLE`, `IDENTITY_PROVIDER_UNAVAILABLE`. |
+| Execução interna | `INTERNAL_ERROR`. |
 | Autorização | `INVALID_ACCESS_TOKEN`, `INSUFFICIENT_ROLE`, `PROVIDER_ACCESS_DENIED`. |
-| Mensageria | `INVALID_COMMAND_ENVELOPE`, `INVALID_COMMAND`, `RETRY_EXHAUSTED`, `PROCESSING_FAILED`; falhas permanentes preservam o código auditado. |
+| Mensageria | `INVALID_COMMAND_ENVELOPE`, `INVALID_COMMAND`, `RETRY_EXHAUSTED`, `PROCESSING_FAILED`, `ACK_FAILED`, `SQS_CALL_TIMEOUT`, `OPERATION_CANCELLED`; falhas permanentes preservam o código auditado. |
 
 `MONEY_OVERFLOW` pode aparecer como `400` quando o próprio valor de entrada excede o limite, ou como rejeição financeira quando uma operação válida faria o saldo ultrapassá-lo. Códigos de erro de programação, como tentativa de alterar entidade terminal, não são convertidos em rejeições financeiras silenciosas.
 
@@ -137,11 +155,17 @@ As filas são `wager-transactions.fifo`, `wager-transactions-dlq.fifo` e a fila 
 
 O hash da inbox inclui a idempotency key e os campos canônicos de negócio. Reutilizar `(consumerName, messageId)` com outra key ou payload gera conflito permanente. Marcar a inbox como processada participa da mesma transação financeira, inclusive quando a operação já havia sido processada por HTTP e a entrada SQS apenas registra o replay.
 
+O cliente SQS configura timeout de conexão de 3 segundos, timeout efetivo de requisição de 25 segundos com `throwOnRequestTimeout: true` e no máximo três tentativas do SDK. `sqsCall` acrescenta um deadline total de 30 segundos que inclui essas tentativas e seus backoffs, com cancelamento explícito. Esse limite comporta o long poll de 20 segundos. Operações de heartbeat e cleanup usam orçamentos menores. O número de tentativas do SDK é independente do limite de recebimentos do consumidor.
+
 O consumidor faz ack depois que o caso de uso retorna do commit. Rejeição de negócio é terminal e recebe ack; infraestrutura transitória recebe retry com visibilidade/backoff. O limite padrão é cinco recebimentos. Envelope inválido e falhas permanentes seguem para DLQ; esgotamento usa `RETRY_EXHAUSTED`.
 
 Quando o comando é válido e o banco está acessível, `failSubmission` persiste `FAILED`, snapshot, inbox e `WagerTransactionFailed` sem aplicar dinheiro. Essa auditoria não substitui resultado terminal anterior: falhar o ack de uma aposta já processada não pode transformá-la em FAILED. Se o banco estiver indisponível, o original pode chegar à DLQ sem auditoria SQL de FAILED; corpo e metadados do broker permanecem a evidência recuperável.
 
-A visibilidade é renovada enquanto a mensagem está em andamento. No desligamento, o consumidor tenta drenar por até dez segundos e devolve visibilidade das restantes. Um handler que termina depois da devolução não pode fazer ack com aquela posse antiga; os locks e a idempotência protegem uma eventual sobreposição financeira.
+Falha em `DeleteMessage` depois do commit é identificada como `ACK_FAILED`, com `failureStage: ack` e `causeCode` de transporte sanitizado. Ela não altera status, código de falha ou saldo original persistidos. Retry e DLQ carregam os ids e o status financeiro observado; os metadados distinguem falha de processamento de falha de confirmação. Um replay de `FAILED` precisa ser encaminhado à DLQ antes do ack, preservando o código terminal original quando a publicação anterior falhou. O corpo original permanece disponível para recuperação, e a deduplication id da publicação na DLQ é estável por mensagem e código.
+
+A visibilidade é renovada enquanto a mensagem está em andamento, inclusive durante ack e publicação na DLQ. Em `SIGTERM`, os papéis param de admitir trabalho novo, cancelam receives e compartilham uma única janela de drenagem de dez segundos em paralelo. O cleanup padrão dispõe de três segundos para devolver visibilidade e liberar leases ainda pertencentes ao processo; ele fica dentro do orçamento restante anterior ao watchdog de quinze segundos. Um handler que termina depois da devolução não pode fazer ack com aquela posse antiga; os locks e a idempotência protegem uma eventual sobreposição financeira.
+
+O watchdog permanece ativo durante o fechamento do servidor operacional e do pool SQL. Se uma consulta bloqueada impedir o encerramento, o processo termina com código `1` ao atingir o deadline. Uma limpeza que não consegue concluir deixa a visibilidade ou o lease finito expirar para outra instância retomar o trabalho.
 
 ## Outbox e entrega de eventos
 
@@ -153,13 +177,17 @@ A entrega é **at-least-once**. Se o SQS aceitar um evento e o processo morrer a
 
 Falha de envio agenda retry persistido; o registro confirmado na outbox não é removido. A reconciliação do saldo não depende da disponibilidade do broker.
 
+Produção e experimento de carga usam `publisherConfiguration` e `runPublisherLoop`. O lote padrão contém dez eventos, configurável de 1 a 100 por `OUTBOX_BATCH_SIZE`, com lease de 30 segundos. Um lote produtivo é seguido imediatamente pelo próximo. Um ciclo sem publicação espera 250 ms; erro de ciclo espera um segundo. As esperas são canceláveis no desligamento. Isso mantém a mesma política de publicação nos workers e no teste de carga.
+
 ## Consultas, observabilidade e autenticação
 
 O ledger usa cursor opaco contendo wallet, última versão lida e teto de versões da primeira página. Novos lançamentos não deslocam o histórico já em navegação. A reconciliação usa uma única instrução SQL para ler saldo materializado e soma do ledger no mesmo snapshot PostgreSQL, inclusive durante escritas concorrentes. Ela devolve diferença e consistência, registra divergências e não corrige saldos silenciosamente.
 
-Logs JSON incluem os identificadores disponíveis de correlação, mensagem, transação, wallet e provedor, além de status, código e duração. A escrita usa uma lista explícita de campos; não registra payload financeiro completo, saldos, tokens ou segredos. Diagnósticos não alteram o resultado financeiro confirmado.
+Logs JSON incluem os identificadores disponíveis de correlação, mensagem, transação, wallet e provedor, além de status, código e duração. Identificadores válidos são capturados antes da execução para permanecerem disponíveis em falhas de SQL e transporte; depois do processamento, o id da transação é a correlação do resultado. A escrita usa uma lista explícita de campos; não registra payload financeiro completo, saldos, tokens ou segredos. Os wrappers isolam falhas dos contadores, histogramas e do destino dos logs: diagnósticos não alteram o resultado financeiro confirmado nem mascaram o erro original de um rollback.
 
 As métricas Prometheus cobrem resultados por status, duplicatas, retries, DLQ, conflitos de lock, inconsistências de reconciliação, latência e idade do evento mais antigo da outbox. Contadores e histogramas são locais a cada processo e reiniciam com ele; devem ser coletados de todas as instâncias. A contagem por status representa execuções observadas, e uma nova tentativa pendente pode ser contada novamente. O lag da outbox é consultado no banco.
+
+Cada publisher contabiliza eventos confirmados como publicados, falhas de ciclo, retries e perdas de lease em métricas próprias do processo. Os labels têm valores limitados; ids de wallet, jogador ou transação não viram dimensões Prometheus. Observações do consumidor e metadados da DLQ separam `failureStage` e `causeCode`; os logs registram o código operacional e a causa de transporte em eventos correlacionados.
 
 A API expõe `/metrics` para operador. Cada worker abre um servidor operacional em `127.0.0.1`, com porta configurável por `WORKER_METRICS_PORT`; a porta padrão `0` é dinâmica e o endereço aparece no log de inicialização. Esse endpoint local precisa de coleta por instância e não agrega o cluster.
 
@@ -167,22 +195,27 @@ A API expõe `/metrics` para operador. Cada worker abre um servidor operacional 
 
 A autenticação HTTP integra Keycloak por OIDC, usando `client_credentials`. O verificador exige assinatura RS256 válida, issuer, audience, expiração e claims de service account. As chaves públicas vêm do JWKS. Não existe tabela própria de senhas.
 
+A leitura do JWKS tem timeout de três segundos e cache de cinco minutos. Chaves já válidas no cache podem continuar verificando tokens durante uma indisponibilidade. Falha de rede, timeout, resposta HTTP inesperada, JSON malformado ou material JWKS inválido recebem `503/IDENTITY_PROVIDER_UNAVAILABLE`. Assinatura, claims ou chave de assinatura desconhecida em um JWKS válido continuam sendo falhas de autenticação `401`.
+
 Um cliente com role `dwp-provider` só submete operações com seu `providerId` e consulta suas próprias transações. A role `dwp-operator` administra/consulta wallets, ledger, reconciliação e métricas, e pode consultar transações dos provedores. Um token de operador não substitui a identidade de provedor para submeter apostas. A autorização compara identidade do token com body, path ou transação consultada conforme a rota.
 
 Autenticação só é desativada quando `AUTH_ENABLED=false` está explícito para desenvolvimento/testes; sem essa opção, a configuração OIDC é obrigatória. SQS é um canal interno confiável quanto ao transporte, mas o provedor e os demais campos da mensagem passam pelas mesmas validações financeiras.
 
 ## Evidências e limites
 
-As execuções de validação da entrega registraram 59 testes unitários, 119 testes de integração e 4 testes de autenticação. A suíte cobre parsing/limites, estados terminais, regras financeiras, SQL direto e migrations, 50 submissões paralelas da mesma aposta, duas apostas de `80.00` disputando `100.00`, wallets independentes e três processos reais. As regressões de reversão verificam REFUND seguido de ROLLBACK e a ordem inversa, a disputa concorrente entre os tipos, reprocessamento de referências pendentes, replay da rejeição, ROLLBACK do próprio REFUND e a proteção do índice por SQL direto. A migration de unicidade é testada em ida/volta e com histórico incompatível, sem alteração de dados financeiros.
+As execuções finais registraram **250 testes aprovados: 87 unitários, 159 de integração e 4 de autenticação**. A suíte cobre parsing/limites, estados terminais, regras financeiras, SQL direto e migrations, 50 submissões paralelas da mesma aposta, duas apostas de `80.00` disputando `100.00`, wallets independentes e três processos reais. As regressões de reversão verificam REFUND seguido de ROLLBACK e a ordem inversa, a disputa concorrente entre os tipos, reprocessamento de referências pendentes, replay da rejeição, ROLLBACK do próprio REFUND e a proteção do índice por SQL direto. A migration de unicidade é testada em ida/volta e com histórico incompatível, sem alteração de dados financeiros.
 
-Os cenários de falha incluem rollback antes do commit, redelivery após commit antes do ack, dois publishers, retomada de leases, indisponibilidade de PostgreSQL/SQS, referências fora de ordem, expiração e disputa de reprocessamento com HTTP. Os testes de crash usam processos separados e `SIGKILL` em pontos antes/depois do envio e depois do commit antes do ack. Os cenários financeiros conferem reconstrução do saldo pelo ledger, ausência de efeitos duplicados e não negatividade.
+O modelo financeiro independente usa centavos inteiros, estados e regras próprios, sem importar `Money`, entidades ou helpers da implementação. Três seeds fixas (`424242`, `424243`, `424244`) geram trinta sequências cada, com três wallets e no máximo trinta comandos por sequência. A execução registrada percorreu **90 sequências e 1.491 comandos** em PostgreSQL real, incluindo todos os tipos, conflitos, replays e snapshots pendentes da inbox. As chamadas alternam o caso de uso sem contexto de inbox e com esse contexto; a entrega pelo broker é coberta pelas integrações SQS separadas. Os testes informam seed e caminho de reprodução da sequência em caso de divergência.
+
+A refatoração para ports e adapter foi conferida com os mesmos cenários financeiros e com o modelo independente. Uma comparação estática confirmou a preservação dos 21 literais SQL distintos de escrita e consulta, além da revisão da ordem dos locks e da consulta única de reconciliação.
+
+Os cenários de falha incluem rollback antes do commit, redelivery após commit antes do ack, dois publishers, retomada de leases, indisponibilidade de PostgreSQL/SQS, timeout de long poll e ack, desligamento com SQL bloqueado, falhas dos destinos de diagnóstico, referências fora de ordem, expiração e disputa de reprocessamento com HTTP. Os testes de crash usam processos separados e `SIGKILL` em pontos antes/depois do envio e depois do commit antes do ack. Os cenários financeiros conferem reconstrução do saldo pelo ledger, ausência de efeitos duplicados e não negatividade.
 
 Limites assumidos:
 
 - Runtime de aplicação em BRL, embora `Money` modele múltiplas moedas.
 - Ledger de movimentos por wallet; não implementa contabilidade de partidas dobradas.
 - Versão financeira limitada ao `INTEGER` SQL, com rejeição explícita antes de exceder `2147483647`.
-- Casos de uso dependem explicitamente de MikroORM/SQL; não há abstração de repositório independente do banco.
 - Identidade de wallet inexistente gera `404` sem transação de aposta persistida.
 - Uma indisponibilidade do banco pode impedir auditoria SQL de FAILED antes da DLQ; a mensagem original permanece no broker.
 - Métricas são por processo. A fila de eventos exige deduplicação e tratamento de desordem pelos consumidores externos.
@@ -190,46 +223,86 @@ Limites assumidos:
 
 ## Experimento de carga
 
-`bun run test:load` cria um banco e uma fila de eventos isolados, inicia três APIs reais e dois loops de publisher. Executa cenários de wallet disputada e wallets independentes, cada um com concorrência 1, 10 e 50, aquecimento de 15 segundos e medição de 60 segundos. A carga submete BETs de `0.01 BRL`; os registros de cada cenário usam identidades únicas.
+`bun run test:load` cria banco e fila de eventos isolados e inicia **três processos de API e dois processos reais de publisher**. Os publishers executam o entrypoint normal com o mesmo leitor de configuração e o mesmo loop usado fora do teste: lote padrão de **10**, lease de `30s`, espera de `250ms` apenas em ciclos sem publicação e de `1s` após erro. Não há override oculto de lote no runner.
 
-O relatório descarta métricas do aquecimento, registra tempo efetivo, throughput de respostas bem-sucedidas, p50/p95/p99, HTTP/status/falhas, conflitos de lock, deadlocks PostgreSQL, lag e pendências da outbox, retries de publisher, perda de leases e recursos do driver/APIs. A latência inclui falhas e o throughput considera a conclusão das requisições em andamento. No fim, o experimento drena a outbox e reconcilia todas as wallets e identidades antes de declarar sucesso.
+Cada execução percorre wallet disputada e wallets independentes, com concorrências `1`, `10` e `50`, **15 segundos de aquecimento e 60 segundos de medição** por combinação. Cada cliente mantém uma requisição em andamento e afinidade com uma API. O tráfego contém BETs de `0.01 BRL`; os identificadores são únicos. O aquecimento fica fora dos percentis e do throughput, mas seus contadores são preservados para conferir o total de apostas persistidas.
 
-### Execução completa registrada
+O relatório registra ambiente, PIDs/configuração, throughput, p50/p95/p99, erros, replays, conflitos de lock, deadlocks, outbox lag/backlog, métricas individuais dos publishers e recursos dos processos. Antes de declarar sucesso, exige respostas válidas sem erros/replays inesperados, correspondência entre requisições bem-sucedidas e apostas persistidas, processos vivos, reconciliação e drenagem dentro do orçamento. Eventos publicados depois desse orçamento durante o shutdown não convertem uma drenagem tardia em sucesso.
 
-Execução de 25/10/2026, das **19:13:29 às 19:21:33 BRT** (`America/Sao_Paulo`, UTC−03), identificada por `beae85b0-3e5b-4b61-932c-be3dc7c5ff30`. A implementação funcional usada no experimento corresponde ao commit `92deb97`.
+### Ambiente e reprodução
+
+Foram realizadas **três execuções completas e sequenciais em 26/10/2026**, sem outras suítes ou cargas concorrentes. As medições correspondem ao commit `960f8d7877fa881de23571d7ca5ed47eeb096fcd`; a documentação foi concluída depois das medições. Os horários abaixo usam **BRT / America/Sao_Paulo (UTC−03)**.
 
 | Parâmetro | Ambiente medido |
 | --- | --- |
-| CPU | AMD EPYC 9V45, 5 CPUs lógicas visíveis, quota efetiva de 4 vCPU (`cpu.max = 400000 100000`). |
+| CPU | AMD EPYC 9V45; 5 CPUs lógicas visíveis, quota efetiva de 4 vCPU (`cpu.max = 400000 100000`). |
 | Memória | Limite de cgroup de 16 GiB (`17179869184` bytes). |
-| Sistema/runtime | Linux 6.18.55, x64, Bun 1.4.4. |
+| Sistema/runtime | Linux 6.18.55 x64; Bun 1.4.4. |
 | Stack | NestJS 12.2.0, MikroORM 7.2.5, PostgreSQL 17.6-alpine, AWS SDK SQS 3.1156.0 e MiniStack 1.5.32. |
-| Processos | 3 APIs reais e 2 loops de publisher; driver, PostgreSQL e MiniStack no mesmo host. |
-| Autenticação | Desativada explicitamente durante a carga; a integração Keycloak foi validada separadamente. |
+| Processos | 3 APIs e 2 publishers separados, todos vivos até o fim; cada publisher terminou com código 0. Driver, banco e broker no mesmo host. |
+| Publisher | `OUTBOX_BATCH_SIZE=10`, lease de 30 s, espera ociosa de 250 ms, espera após erro de 1 s. |
+| Autenticação | Desativada explicitamente na carga; Keycloak validado separadamente pela suíte de autenticação. |
+| Drenagem | Orçamento de 60 s em todas as execuções, sem ampliação. |
 
-Cada linha abaixo representa sua janela de medição, depois dos 15 segundos de aquecimento. RPS considera o tempo efetivo até a conclusão das requisições em andamento. Latências estão em milissegundos; lag é a idade do evento pendente mais antigo, em segundos. Os percentis vêm de um histograma com buckets de 1 ms, portanto não têm precisão submilissegundo. Os máximos de lag/pendências são observações com amostragem de 1 segundo.
+```bash
+for load_run in 1 2 3
+do
+  LOAD_WARMUP_SECONDS=15 LOAD_DURATION_SECONDS=60 LOAD_OUTBOX_DRAIN_SECONDS=60 OUTBOX_BATCH_SIZE=10 \
+    LOAD_REPORT_PATH="load-results-${load_run}.json" bun run test:load
+done
+```
 
-| Cenário / concorrência | RPS | p50 ms | p95 ms | p99 ms | Erros | Maior lag observado s | Pico de pendências |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Wallet disputada / 1 | 269,6 | 4 | 7 | 10 | 0 | 0,033331 | 17 |
-| Wallet disputada / 10 | 220,4 | 29 | 143 | 230 | 0 | 0,031704 | 16 |
-| Wallet disputada / 50 | 139,6 | 283 | 870 | 1.247 | 0 | 0,035311 | 8 |
-| Wallets independentes / 1 | 272,0 | 4 | 7 | 9 | 0 | 0,293948 | 213 |
-| Wallets independentes / 10 | 610,7 | 15 | 30 | 40 | 0 | 1,813094 | 2.257 |
-| Wallets independentes / 50 | 848,4 | 58 | 94 | 116 | 0 | 49,251390 | 83.385 |
+### Resultados por execução
 
-As seis janelas medidas concluíram **141.778 requisições**, todas `HTTP 200 / PROCESSED`, sem erros ou replays inesperados. Incluindo os aquecimentos, foram processadas **176.344 BETs**; a diferença corresponde a 34.566 apostas de aquecimento. A reconciliação final conferiu **64 wallets**, **176.408 lançamentos** — BETs mais 64 aberturas — e a unicidade de todas as keys, identidades externas e efeitos de ledger. Não houve efeito financeiro duplicado, saldo negativo ou divergência de saldo.
+| Execução | Início BRT | Fim BRT | Requisições medidas | Apostas com aquecimento | Eventos publicados | Drenagem s |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | 11:21:12 | 11:29:42 | 122.184 | 152.299 | 304.726 | 54,8540 |
+| 2 | 11:29:44 | 11:38:11 | 119.260 | 147.958 | 296.044 | 52,1400 |
+| 3 | 11:38:13 | 11:46:43 | 122.160 | 152.339 | 304.806 | 55,6187 |
 
-Foram confirmados **352.816 eventos na outbox, todos publicados**, com zero pendências ao final. A drenagem depois do tráfego levou **32,0838 segundos**. Todas as APIs permaneceram vivas. Nas janelas observadas, houve zero conflitos de lock reportados pela aplicação e zero deadlocks PostgreSQL. Os publishers registraram zero retries, zero perdas de lease e nenhuma falha de publicação.
+Identificadores dos relatórios:
+
+- Execução 1: `90f553d7-cdc7-42ef-bc57-938c8ad2ef76`.
+- Execução 2: `5d377cdf-ebfc-43d1-ad09-afa4f71629e0`.
+- Execução 3: `f5420872-d635-438e-8da1-25a645e55e28`.
+
+Cada linha seguinte é uma janela de medição após o aquecimento. RPS usa o tempo efetivo até concluir as requisições em andamento. Latências estão em milissegundos; lag é a idade do evento pendente mais antigo, em segundos. Os percentis usam buckets de 1 ms; os máximos de lag/backlog são amostrados a cada segundo.
+
+| Execução | Cenário | Clientes | RPS | p50 ms | p95 ms | p99 ms | Erros | Maior lag s | Pico pendente |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | Wallet disputada | 1 | 264,4 | 3 | 10 | 14 | 0 | 0,261197 | 176 |
+| 1 | Wallet disputada | 10 | 205,7 | 30 | 158 | 256 | 0 | 0,277129 | 152 |
+| 1 | Wallet disputada | 50 | 125,6 | 317 | 966 | 1.429 | 0 | 0,292297 | 98 |
+| 1 | Wallets independentes | 1 | 252,1 | 3 | 10 | 14 | 0 | 0,270660 | 196 |
+| 1 | Wallets independentes | 10 | 476,9 | 19 | 38 | 49 | 0 | 19,260716 | 19.848 |
+| 1 | Wallets independentes | 50 | 710,0 | 70 | 107 | 134 | 0 | 66,329434 | 93.020 |
+| 2 | Wallet disputada | 1 | 265,6 | 3 | 9 | 14 | 0 | 0,251414 | 166 |
+| 2 | Wallet disputada | 10 | 206,6 | 29 | 160 | 256 | 0 | 0,253202 | 144 |
+| 2 | Wallet disputada | 50 | 129,7 | 308 | 918 | 1.343 | 0 | 0,301530 | 92 |
+| 2 | Wallets independentes | 1 | 258,8 | 3 | 9 | 13 | 0 | 0,255064 | 186 |
+| 2 | Wallets independentes | 10 | 485,3 | 19 | 37 | 46 | 0 | 17,669077 | 18.299 |
+| 2 | Wallets independentes | 50 | 639,8 | 78 | 120 | 149 | 0 | 66,665603 | 84.130 |
+| 3 | Wallet disputada | 1 | 271,0 | 3 | 9 | 14 | 0 | 0,250024 | 204 |
+| 3 | Wallet disputada | 10 | 210,4 | 30 | 158 | 243 | 0 | 0,261840 | 150 |
+| 3 | Wallet disputada | 50 | 121,6 | 326 | 986 | 1.477 | 0 | 0,316770 | 90 |
+| 3 | Wallets independentes | 1 | 256,0 | 3 | 10 | 14 | 0 | 0,485616 | 257 |
+| 3 | Wallets independentes | 10 | 490,5 | 19 | 37 | 46 | 0 | 18,148486 | 18.284 |
+| 3 | Wallets independentes | 50 | 684,8 | 73 | 107 | 129 | 0 | 66,492307 | 90.150 |
+
+As três execuções concluíram **363.604 requisições medidas**, todas `HTTP 200 / PROCESSED`. Somando **88.992 apostas de aquecimento**, foram **452.596 BETs**, **192 wallets reconciliadas**, **452.788 lançamentos** e **905.576 eventos marcados como publicados**. Todas as keys, identidades externas e efeitos de ledger eram únicos; não houve saldo negativo, efeito financeiro duplicado ou divergência. Os contadores individuais dos publishers somaram o total publicado, e as contagens aproximadas das filas locais foram compatíveis.
+
+Houve zero erros de tráfego, replays inesperados, conflitos de lock reportados, deadlocks PostgreSQL, retries de publisher, perdas de lease ou falhas de ciclo. Todas as amostras de recursos/lag foram coletadas. As três outboxes zeraram **antes do limite de 60 s**, com `remainingAtDrainDeadline=0`, e continuaram sem pendências depois do encerramento dos processos.
 
 ### Interpretação e alcance
 
-Na wallet disputada, elevar a concorrência de 1 para 50 reduziu o throughput de 269,6 para 139,6 RPS e elevou o p99 de 10 para 1.247 ms. Os movimentos sobre a mesma wallet precisam ser serializados; mais clientes aumentaram a espera sem ampliar a capacidade desse agregado. Não houve perda de atualização ou quebra de saldo nesse cenário.
+Na wallet disputada, os três resultados com 50 clientes ficaram entre **121,6 e 129,7 RPS**, com p99 entre **1.343 e 1.477 ms**. A serialização protege o saldo; elevar a concorrência aumenta a espera pelo agregado. Zero erros de conflito não significa ausência de espera por locks.
 
-Wallets independentes aproveitaram o paralelismo: com concorrência 50, o resultado foi 848,4 RPS e p99 de 116 ms. Entretanto, a confirmação financeira ficou à frente da publicação: essa janela começou com 17.420 eventos pendentes e terminou com 83.161, chegando ao pico observado de 83.385 e a lag de 49,251390 segundos. Nessa configuração, a capacidade de publicação durante a janela foi inferior à entrada de eventos. O backlog foi preservado e completamente drenado depois do tráfego.
+Wallets independentes com 50 clientes ficaram entre **639,8 e 710,0 RPS**, com p99 entre **129 e 149 ms**. Nesse pico, a publicação ficou atrás da entrada financeira: os backlogs finais foram 93.020, 84.130, 90.150 eventos nas execuções 1, 2 e 3. O maior pico foi **93.020 eventos**, e o maior lag observado foi **66,665603 s**. Tudo foi preservado e drenado após a interrupção do tráfego. Isso comprova recuperação dentro da janela deste experimento; não demonstra estabilidade indefinida sob a mesma taxa de entrada.
 
-API, driver, banco, broker e publishers disputaram a mesma quota de CPU. O experimento não isolou o custo de cada componente nem instrumentou CPU, I/O e esperas com granularidade suficiente para atribuir um gargalo específico ao runtime, ORM ou broker. O resultado sustenta separar a capacidade financeira da capacidade de publicação ao dimensionar o sistema; não estabelece uma capacidade de produção do SQS.
+As janelas de maior concorrência já começaram com eventos pendentes dos aquecimentos e cenários anteriores. Banco e fila são novos entre execuções, mas crescem dentro de cada execução, em ordem fixa. As três repetições mostram a variação local; não representam uma comparação estatística de capacidade de produção. Não há meta artificial de RPS.
 
-Foi realizada **uma execução completa**, em ordem fixa, com o mesmo banco crescendo entre cenários. Cada cliente de carga mantém afinidade com uma API, em vez de passar por um balanceador real. O teste usa MiniStack no mesmo host, sem latência externa ou topologia multi-AZ. Essas condições, a autenticação desativada e a resolução do histograma limitam a generalização dos números. Não há meta artificial de RPS nem comparação estatística entre repetições.
+API, driver, publishers, PostgreSQL e MiniStack compartilham a quota de CPU. CPU, I/O e esperas não foram isolados com granularidade suficiente para atribuir um gargalo específico ao runtime, ORM ou broker. O dimensionamento deve considerar separadamente a capacidade de confirmação financeira e a de publicação.
 
-O comando gera o relatório JSON completo em `LOAD_REPORT_PATH`, cujo padrão é `load-results.json`. Esse artefato local fica fora do Git; os resultados relevantes e as condições desta execução estão versionados neste documento.
+O tráfego é fechado: cada cliente espera a resposta antes da próxima requisição e mantém afinidade com uma API, sem balanceador real. O teste usa apenas BETs, autenticação desativada e MiniStack local, sem latência externa, limites reais do AWS SQS ou topologia multi-AZ. Também não mede o consumo downstream dos eventos. Esses limites e a resolução de 1 ms restringem a generalização das latências e vazões.
+
+Os relatórios JSON completos são gravados em `LOAD_REPORT_PATH`, cujo padrão é `load-results.json`, e permanecem fora do Git. Os resultados e condições relevantes das três execuções estão registrados acima.
