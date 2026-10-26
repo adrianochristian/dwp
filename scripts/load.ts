@@ -5,13 +5,17 @@ import { availableParallelism, cpus, freemem, platform, release, totalmem } from
 import { resolve } from 'node:path';
 import { WageringService, type SubmissionResult } from '../dist/application/wagering-service.js';
 import { Money } from '../dist/domain/money.js';
-import { OutboxPublisher } from '../dist/infrastructure/messaging/outbox-publisher.js';
-import { createSqsClient } from '../dist/infrastructure/messaging/sqs.js';
+import { publisherConfiguration, type PublisherConfiguration } from '../dist/infrastructure/messaging/publisher-loop.js';
+import { createSqsClient, sqsCall } from '../dist/infrastructure/messaging/sqs.js';
 import { createDatabase } from '../dist/infrastructure/persistence/database.js';
 
 type Scenario = 'hot-wallet' | 'independent-wallets';
 type Child = ReturnType<typeof Bun.spawn>;
-interface Instance { child: Child; address: string; logs: Promise<void>; errorLogs: Promise<void> }
+interface Instance {
+  child: Child; address: string; logs: Promise<void>; errorLogs: Promise<void>;
+  configuration?: PublisherConfiguration;
+}
+interface PublisherMetrics { published: number; retries: number; leaseLosses: number; failures: number }
 interface Lag { pending: number; oldestSeconds: number }
 interface Wallet { id: string; playerId: string }
 
@@ -44,12 +48,16 @@ async function processRss(pid: number): Promise<number> {
   return match ? Number(match[1]) * 1_024 : 0;
 }
 
-async function startInstance(databaseUrl: string): Promise<Instance> {
-  const child = Bun.spawn([process.execPath, 'dist/main.js'], {
-    env: { ...process.env, DATABASE_URL: databaseUrl, PORT: '0', AUTH_ENABLED: 'false' },
+async function startInstance(databaseUrl: string, eventQueueUrl?: string): Promise<Instance> {
+  const child = Bun.spawn([process.execPath, eventQueueUrl ? 'dist/worker.js' : 'dist/main.js'], {
+    env: {
+      ...process.env, DATABASE_URL: databaseUrl, PORT: '0', AUTH_ENABLED: 'false',
+      ...(eventQueueUrl ? { WORKER_ROLE: 'publisher', WORKER_METRICS_PORT: '0', EVENT_QUEUE_URL: eventQueueUrl } : {}),
+    },
     stdout: 'pipe', stderr: 'pipe',
   });
   let started = false;
+  let configuration: PublisherConfiguration | undefined;
   let resolveAddress: (value: string) => void = () => undefined;
   let rejectAddress: (error: Error) => void = () => undefined;
   const address = new Promise<string>((resolveStartup, rejectStartup) => {
@@ -70,10 +78,15 @@ async function startInstance(databaseUrl: string): Promise<Instance> {
           pending = pending.slice(newline + 1);
           if (started) continue;
           try {
-            const record = JSON.parse(line) as { event?: string; address?: string };
-            if (record.event === 'server_started' && record.address) {
+            const record = JSON.parse(line) as {
+              event?: string; address?: string; metricsAddress?: string; publisherConfiguration?: PublisherConfiguration;
+            };
+            const startupAddress = eventQueueUrl && record.event === 'worker_started'
+              ? record.metricsAddress : !eventQueueUrl && record.event === 'server_started' ? record.address : undefined;
+            if (startupAddress) {
               started = true;
-              resolveAddress(record.address.replace('0.0.0.0', '127.0.0.1'));
+              configuration = record.publisherConfiguration;
+              resolveAddress(startupAddress.replace('0.0.0.0', '127.0.0.1'));
             }
           } catch { /* Drain other startup diagnostics without retaining request logs. */ }
         }
@@ -92,18 +105,48 @@ async function startInstance(databaseUrl: string): Promise<Instance> {
   const timer = setTimeout(() => {
     rejectAddress(new LoadExperimentError('PROCESS_START_TIMEOUT', 'An API process did not listen within 15 seconds'));
   }, 15_000);
-  try { return { child, address: await address, logs, errorLogs }; }
+  try {
+    const startupAddress = await address;
+    if (eventQueueUrl && JSON.stringify(configuration) !== JSON.stringify(publisherConfiguration())) {
+      throw new LoadExperimentError('PUBLISHER_CONFIGURATION_MISMATCH', 'The publisher did not use the shared runtime configuration');
+    }
+    return { child, address: startupAddress, logs, errorLogs, ...(configuration ? { configuration } : {}) };
+  }
   catch (error) { child.kill('SIGKILL'); await child.exited; await Promise.allSettled([logs, errorLogs]); throw error; }
   finally { clearTimeout(timer); }
 }
 
 async function stopInstance(instance: Instance): Promise<void> {
   if (instance.child.exitCode === null) instance.child.kill('SIGTERM');
-  const timer = setTimeout(() => instance.child.kill('SIGKILL'), 10_000);
+  const timer = setTimeout(() => instance.child.kill('SIGKILL'), 16_000);
   try {
     await instance.child.exited;
     await Promise.allSettled([instance.logs, instance.errorLogs]);
   } finally { clearTimeout(timer); }
+}
+
+async function publisherMetrics(instances: readonly Instance[]): Promise<PublisherMetrics[]> {
+  return Promise.all(instances.map(async instance => {
+    const response = await fetch(`${instance.address}/metrics`, { signal: AbortSignal.timeout(5_000) });
+    if (!response.ok) throw new LoadExperimentError('PUBLISHER_METRICS_UNAVAILABLE', 'A publisher metrics endpoint is unavailable');
+    const body = await response.text();
+    const counter = (name: string): number => {
+      const lines = body.split('\n').filter(line => line.startsWith(`dwp_${name}_total{role="publisher"} `)
+        || line.startsWith(`dwp_${name}_total `));
+      if (lines.length !== 1) throw new LoadExperimentError('PUBLISHER_METRICS_UNAVAILABLE', 'A publisher counter is missing or ambiguous');
+      const value = Number(lines[0]!.slice(lines[0]!.lastIndexOf(' ') + 1));
+      if (!Number.isFinite(value) || value < 0) throw new LoadExperimentError('PUBLISHER_METRICS_UNAVAILABLE', 'A publisher counter is invalid');
+      return value;
+    };
+    return { published: counter('outbox_published'), retries: counter('retries'),
+      leaseLosses: counter('outbox_lease_losses'), failures: counter('outbox_failures') };
+  }));
+}
+
+function sumPublisherMetrics(values: readonly PublisherMetrics[]): PublisherMetrics {
+  return values.reduce((total, value) => ({ published: total.published + value.published, retries: total.retries + value.retries,
+    leaseLosses: total.leaseLosses + value.leaseLosses, failures: total.failures + value.failures }),
+  { published: 0, retries: 0, leaseLosses: 0, failures: 0 });
 }
 
 async function lockConflicts(instances: readonly Instance[]): Promise<number | null> {
@@ -275,12 +318,7 @@ async function main(): Promise<void> {
   const initialBalance = Money.from({ amount: '1000000.00', currency: 'BRL' });
   const sqs = createSqsClient();
   const instances: Instance[] = [];
-  const publishers: OutboxPublisher[] = [];
-  const publisherLoops: Promise<void>[] = [];
-  const publisherFailures: Record<string, number> = {};
-  let publisherRetries = 0;
-  let leaseLosses = 0;
-  let stopPublishers = false;
+  const publishers: Instance[] = [];
   let interrupted = false;
   const interrupt = () => { interrupted = true; };
   process.on('SIGINT', interrupt);
@@ -301,7 +339,7 @@ async function main(): Promise<void> {
     databaseUrl.pathname = `/${databaseName}`;
     orm = await createDatabase(databaseUrl.toString());
     await orm.migrator.up();
-    queueUrl = (await sqs.send(new CreateQueueCommand({ QueueName: queueName }))).QueueUrl;
+    queueUrl = (await sqsCall(signal => sqs.send(new CreateQueueCommand({ QueueName: queueName }), { abortSignal: signal }))).QueueUrl;
     if (!queueUrl) throw new LoadExperimentError('QUEUE_SETUP_FAILED', 'SQS did not return a queue URL');
     const startupResults = await Promise.allSettled(Array.from({ length: 3 }, async () => {
       const instance = await startInstance(databaseUrl.toString());
@@ -309,20 +347,12 @@ async function main(): Promise<void> {
     }));
     const startupFailure = startupResults.find(result => result.status === 'rejected');
     if (startupFailure?.status === 'rejected') throw startupFailure.reason;
-    for (let index = 0; index < 2; index += 1) {
-      const publisher = new OutboxPublisher(orm, sqs, queueUrl, {
-        batchSize: 100,
-        onRetry: () => { publisherRetries += 1; },
-        onLeaseLost: () => { leaseLosses += 1; },
-      });
-      publishers.push(publisher);
-      publisherLoops.push((async () => {
-        while (!stopPublishers) {
-          try { if (await publisher.runOnce() === 0) await Bun.sleep(20); }
-          catch (error) { increment(publisherFailures, error instanceof Error ? error.name : 'UnknownError'); await Bun.sleep(100); }
-        }
-      })());
-    }
+    const publisherStarts = await Promise.allSettled(Array.from({ length: 2 }, async () => {
+      publishers.push(await startInstance(databaseUrl.toString(), queueUrl!));
+    }));
+    const publisherStartFailure = publisherStarts.find(result => result.status === 'rejected');
+    if (publisherStartFailure?.status === 'rejected') throw publisherStartFailure.reason;
+    await publisherMetrics(publishers);
     const service = new WageringService(orm);
     for (const scenario of ['hot-wallet', 'independent-wallets'] as const) {
       for (const concurrency of [1, 10, 50]) {
@@ -336,11 +366,11 @@ async function main(): Promise<void> {
         const conflictsBefore = await lockConflicts(instances);
         const deadlocksBefore = await deadlocks(orm);
         const lagBefore = await outboxLag(orm);
-        const retriesBefore = publisherRetries;
-        const leaseLossesBefore = leaseLosses;
+        const publisherBefore = sumPublisherMetrics(await publisherMetrics(publishers));
         const cpuBefore = process.cpuUsage();
         let driverPeakRssBytes = process.memoryUsage().rss;
         let apiPeakRssBytes = 0;
+        let publisherPeakRssBytes = 0;
         let maximumLagSeconds = lagBefore.oldestSeconds;
         let maximumPending = lagBefore.pending;
         let sampleFailures = 0;
@@ -350,13 +380,15 @@ async function main(): Promise<void> {
         const sampler = (async () => {
           while (sampling) {
             try {
-              const [lag, memory] = await Promise.all([
+              const [lag, memory, publisherMemory] = await Promise.all([
                 outboxLag(orm!), Promise.all(instances.map(instance => processRss(instance.child.pid))),
+                Promise.all(publishers.map(instance => processRss(instance.child.pid))),
               ]);
               maximumLagSeconds = Math.max(maximumLagSeconds, lag.oldestSeconds);
               maximumPending = Math.max(maximumPending, lag.pending);
               driverPeakRssBytes = Math.max(driverPeakRssBytes, process.memoryUsage().rss);
               apiPeakRssBytes = Math.max(apiPeakRssBytes, memory.reduce((sum, value) => sum + value, 0));
+              publisherPeakRssBytes = Math.max(publisherPeakRssBytes, publisherMemory.reduce((sum, value) => sum + value, 0));
             } catch { sampleFailures += 1; }
             await Promise.race([Bun.sleep(1_000), finishedSampling]);
           }
@@ -369,6 +401,7 @@ async function main(): Promise<void> {
         const cpu = process.cpuUsage(cpuBefore);
         const conflictsAfter = await lockConflicts(instances);
         const lagAfter = await outboxLag(orm);
+        const publisherAfter = sumPublisherMetrics(await publisherMetrics(publishers));
         const measurement = {
           scenario, concurrency, configuredSeconds: measurementSeconds, ...result,
           lockConflicts: conflictsBefore === null || conflictsAfter === null ? null : conflictsAfter - conflictsBefore,
@@ -377,9 +410,12 @@ async function main(): Promise<void> {
             start: lagBefore, end: lagAfter,
             maxObservedLagSeconds: Math.max(maximumLagSeconds, lagAfter.oldestSeconds),
             maxObservedPending: Math.max(maximumPending, lagAfter.pending), sampleIntervalMs: 1_000, sampleFailures,
-            publisherRetries: publisherRetries - retriesBefore, leaseLosses: leaseLosses - leaseLossesBefore,
+            published: publisherAfter.published - publisherBefore.published,
+            publisherRetries: publisherAfter.retries - publisherBefore.retries,
+            leaseLosses: publisherAfter.leaseLosses - publisherBefore.leaseLosses,
+            publisherFailures: publisherAfter.failures - publisherBefore.failures,
           },
-          resources: { driverCpuSeconds: (cpu.user + cpu.system) / 1_000_000, driverPeakRssBytes, apiPeakRssBytes },
+          resources: { driverCpuSeconds: (cpu.user + cpu.system) / 1_000_000, driverPeakRssBytes, apiPeakRssBytes, publisherPeakRssBytes },
         };
         measurements.push(measurement);
         progress('load_measurement_finished', measurement);
@@ -392,25 +428,33 @@ async function main(): Promise<void> {
       await Bun.sleep(100);
       finalLag = await outboxLag(orm);
     }
-    stopPublishers = true;
-    await Promise.allSettled(publisherLoops);
-    await Promise.all(publishers.map(publisher => publisher.stop()));
+    const remainingAtDrainDeadline = finalLag.pending;
+    const drainedWithinBudget = remainingAtDrainDeadline === 0;
+    const drainElapsedSeconds = (performance.now() - drainStarted) / 1_000;
+    const perPublisherMetrics = await publisherMetrics(publishers);
+    const publisherTotals = sumPublisherMetrics(perPublisherMetrics);
+    const publisherProcessIds = publishers.map(instance => instance.child.pid);
+    const publisherProcessesRunning = publishers.every(instance => instance.child.exitCode === null && instance.child.signalCode === null);
+    await Promise.all(publishers.map(stopInstance));
+    const publisherExitCodes = publishers.map(instance => instance.child.exitCode);
+    publishers.length = 0;
     const apiProcessIds = instances.map(instance => instance.child.pid);
     const apiProcessesRunning = instances.every(instance => instance.child.exitCode === null && instance.child.signalCode === null);
     await Promise.all(instances.map(stopInstance));
     instances.length = 0;
     finalLag = await outboxLag(orm);
     const reconciliation = await reconcile(orm, initialBalance, walletCount);
-    const queueAttributes = await sqs.send(new GetQueueAttributesCommand({
+    const queueAttributes = await sqsCall(signal => sqs.send(new GetQueueAttributesCommand({
       QueueUrl: queueUrl, AttributeNames: ['ApproximateNumberOfMessages'],
-    }));
+    }), { abortSignal: signal }));
     const [outbox] = await orm.em.fork().execute<{ total: string; published: string }[]>(`
       select count(*)::text as total, count(*) filter(where published_at is not null)::text as published from dwp.outbox_messages`);
     const report = {
       runId, startedAt, completedAt: new Date().toISOString(),
       configuration: {
         warmupSeconds, measurementSeconds, concurrency: [1, 10, 50], scenarios: ['hot-wallet', 'independent-wallets'],
-        apiProcesses: 3, apiProcessIds, publisherLoops: 2, authEnabled: false, providerId: 'load-provider',
+        apiProcesses: 3, apiProcessIds, publisherProcesses: 2, publisherProcessIds,
+        publisherConfiguration: publisherConfiguration(), authEnabled: false, providerId: 'load-provider',
         bet: { amount: '0.01', currency: 'BRL' }, initialBalance: initialBalance.toJSON(),
         histogramResolutionMs: 1, latencyIncludesFailedRequests: true,
         throughputDefinition: 'successful requests / elapsed measurement seconds, including final in-flight completion',
@@ -425,24 +469,25 @@ async function main(): Promise<void> {
       measurements,
       outbox: {
         ...outbox!, remaining: finalLag.pending, oldestPendingSeconds: finalLag.oldestSeconds,
-        drainSeconds: (performance.now() - drainStarted) / 1_000,
+        drainSeconds: drainElapsedSeconds, configuredDrainSeconds: drainSeconds, remainingAtDrainDeadline, drainedWithinBudget,
         approximateQueuedEvents: queueAttributes.Attributes?.ApproximateNumberOfMessages ?? null,
-        publisherRetries, leaseLosses, publisherFailures,
+        publisherRetries: publisherTotals.retries, leaseLosses: publisherTotals.leaseLosses, publisherFailures: publisherTotals.failures,
+        publisherMetrics: perPublisherMetrics, publisherExitCodes,
       },
       reconciliation,
       apiProcessesSurvived: apiProcessesRunning,
-      complete: !interrupted && apiProcessesRunning && reconciliation.consistent && finalLag.pending === 0,
+      publisherProcessesSurvived: publisherProcessesRunning,
+      complete: !interrupted && apiProcessesRunning && publisherProcessesRunning && publisherExitCodes.every(code => code === 0)
+        && reconciliation.consistent && drainedWithinBudget && finalLag.pending === 0,
     };
     await Bun.write(reportPath, `${JSON.stringify(report, null, 2)}\n`);
     progress('load_report_written', { reportPath, complete: report.complete });
     if (!report.complete) throw new LoadExperimentError('VALIDATION_FAILED', 'Reconciliation or outbox drain failed; inspect the load report');
   } finally {
-    stopPublishers = true;
-    await Promise.allSettled(publisherLoops);
-    await Promise.allSettled(publishers.map(publisher => publisher.stop()));
+    await Promise.allSettled(publishers.map(stopInstance));
     await Promise.allSettled(instances.map(stopInstance));
     await orm?.close(true);
-    if (queueUrl) await sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl })).catch(() => undefined);
+    if (queueUrl) await sqsCall(signal => sqs.send(new DeleteQueueCommand({ QueueUrl: queueUrl }), { abortSignal: signal })).catch(() => undefined);
     sqs.destroy();
     if (admin) {
       if (createdDatabase) await admin.em.getConnection().execute(`drop database if exists ${databaseName} with (force)`);

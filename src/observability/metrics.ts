@@ -1,4 +1,5 @@
-export type CounterName = 'transactions' | 'duplicates' | 'retries' | 'dlq' | 'lock_conflicts' | 'reconciliation_inconsistencies';
+export type CounterName = 'transactions' | 'duplicates' | 'retries' | 'dlq' | 'lock_conflicts' | 'reconciliation_inconsistencies'
+  | 'outbox_published' | 'outbox_lease_losses' | 'outbox_failures';
 
 export interface MetricLabels {
   status?: string;
@@ -12,6 +13,9 @@ const counters: Readonly<Record<CounterName, string>> = Object.freeze({
   dlq: 'Messages sent to a dead letter queue.',
   lock_conflicts: 'Database lock conflicts and transaction retries.',
   reconciliation_inconsistencies: 'Wallet reconciliations that detected a ledger balance mismatch.',
+  outbox_published: 'Events confirmed as published while retaining their outbox lease.',
+  outbox_lease_losses: 'Outbox deliveries that lost their lease before confirmation.',
+  outbox_failures: 'Outbox publisher cycles that failed before completing normally.',
 });
 const statuses = new Set(['PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED']);
 const roles = new Set(['http', 'sqs', 'api', 'consumer', 'publisher', 'reference']);
@@ -39,15 +43,15 @@ export class Metrics {
   private readonly durations = new Map<string, DurationSeries>();
   private outboxLag = 0;
 
-  increment(name: CounterName, labels: MetricLabels = {}): void {
-    if (!Object.hasOwn(counters, name)) return;
+  increment(name: CounterName, labels: MetricLabels = {}, amount = 1): void {
+    if (!Object.hasOwn(counters, name) || !Number.isSafeInteger(amount) || amount < 1) return;
     let series = this.counts.get(name);
     if (!series) {
       series = new Map();
       this.counts.set(name, series);
     }
     const key = labelValues(labels).join(',');
-    series.set(key, (series.get(key) ?? 0) + 1);
+    series.set(key, (series.get(key) ?? 0) + amount);
   }
 
   observeDuration(seconds: number, labels: MetricLabels = {}): void {

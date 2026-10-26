@@ -9,6 +9,7 @@ import { metrics } from './observability/metrics.js';
 import { log } from './observability/logger.js';
 import type { INestApplication } from '@nestjs/common';
 import type { MikroORM } from '@mikro-orm/postgresql';
+import { publisherConfiguration, runPublisherLoop } from './infrastructure/messaging/publisher-loop.js';
 
 export interface WorkerShutdownOptions {
   drainMs?: number;
@@ -37,6 +38,8 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
   let shutdownStartedAt: number | undefined;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
   const startup = new AbortController();
+  const publisherLoop = new AbortController();
+  const publisherOptions = publisherConfiguration();
   const shutdownDeadline = new AbortController();
   let resolveStop!: () => void;
   const stopped = new Promise<void>(resolve => { resolveStop = resolve; });
@@ -45,6 +48,7 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
     stopping = true;
     shutdownStartedAt = performance.now();
     startup.abort(new DOMException('Worker shutting down', 'AbortError'));
+    publisherLoop.abort();
     consumer?.quiesce();
     references?.quiesce();
     publisher?.quiesce();
@@ -70,21 +74,25 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
     if (role === 'publisher' || role === 'all') {
       publisher = new OutboxPublisher(database, sqs,
         process.env.EVENT_QUEUE_URL ?? await getQueueUrl(sqs, queueNames.events, startup.signal), {
+          batchSize: publisherOptions.batchSize,
+          leaseMs: publisherOptions.leaseMs,
           onRetry: message => {
             metrics.increment('retries', { role: 'publisher' });
             log('outbox_retry', { messageId: message.id, correlationId: message.id, attempt: message.attempts, code: 'SQS_PUBLISH_FAILED' });
           },
-          onLeaseLost: message => log('outbox_lease_lost', { messageId: message.id, code: 'OUTBOX_LEASE_LOST' }),
+          onLeaseLost: message => {
+            metrics.increment('outbox_lease_losses', { role: 'publisher' });
+            log('outbox_lease_lost', { messageId: message.id, code: 'OUTBOX_LEASE_LOST' });
+          },
         });
-      const current = publisher;
-      loops.push((async () => {
-        while (!stopping) {
-          try { await current.runOnce(); } catch {
-            log('publisher_cycle_failed', { code: 'INFRASTRUCTURE_UNAVAILABLE' });
-          }
-          if (!stopping) await Bun.sleep(250);
-        }
-      })());
+      loops.push(runPublisherLoop(publisher, publisherOptions, {
+        signal: publisherLoop.signal,
+        onPublished: count => metrics.increment('outbox_published', { role: 'publisher' }, count),
+        onError: () => {
+          metrics.increment('outbox_failures', { role: 'publisher' });
+          log('publisher_cycle_failed', { code: 'INFRASTRUCTURE_UNAVAILABLE' });
+        },
+      }));
     }
     if (role === 'consumer' || role === 'all') {
       const [commands, deadLetters] = await Promise.all([
@@ -129,7 +137,8 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
         }
       })());
     }
-    console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid, metricsAddress: await operational.getUrl() }));
+    console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid, metricsAddress: await operational.getUrl(),
+      ...(publisher ? { publisherConfiguration: publisherOptions } : {}) }));
     await Promise.race([Promise.all(loops), stopped]);
   } catch (error) {
     if (!stopping) throw error;

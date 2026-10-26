@@ -3,6 +3,16 @@ import { Metrics } from '../../src/observability/metrics.js';
 import { log } from '../../src/observability/logger.js';
 
 describe('operational metrics', () => {
+  test('counts confirmed publisher batches without accepting invalid increments', () => {
+    const metrics = new Metrics();
+    metrics.increment('outbox_published', { role: 'publisher' }, 10);
+    metrics.increment('outbox_published', { role: 'publisher' }, 3);
+    metrics.increment('outbox_published', { role: 'publisher' }, -1);
+    metrics.increment('outbox_published', { role: 'publisher' }, Number.NaN);
+    metrics.increment('outbox_published', { role: 'publisher' }, 0.5);
+    expect(metrics.renderPrometheus()).toContain('dwp_outbox_published_total{role="publisher"} 13');
+  });
+
   test('bounds cardinality and omits arbitrary identifiers and invalid label values', () => {
     const metrics = new Metrics();
     metrics.increment('transactions', { status: 'PROCESSED', role: 'http', walletId: 'private-wallet' } as never);
@@ -49,4 +59,5 @@ describe('operational metrics', () => {
       output.mockRestore();
     }
   });
+
 });
