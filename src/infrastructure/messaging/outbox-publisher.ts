@@ -201,7 +201,7 @@ export class OutboxPublisher {
     try {
       await this.options.beforeSend?.(message);
       if (this.cancelling || !await renew()) {
-        if (!this.cancelling) this.options.onLeaseLost?.(message);
+        if (!this.cancelling) this.observe(() => this.options.onLeaseLost?.(message));
         return false;
       }
       await sqsCall(abortSignal => this.sqs.send(new SendMessageCommand({
@@ -215,7 +215,7 @@ export class OutboxPublisher {
       await this.options.afterSend?.(message);
       await finishHeartbeat();
       if (this.cancelling || !owned) {
-        if (!this.cancelling) this.options.onLeaseLost?.(message);
+        if (!this.cancelling) this.observe(() => this.options.onLeaseLost?.(message));
         return false;
       }
       const updated = await this.orm.em.fork().execute<{ id: string }[]>(`
@@ -225,12 +225,12 @@ export class OutboxPublisher {
           and lease_until > clock_timestamp()
         returning id
       `, [message.id, row.lease_token]);
-      if (updated.length !== 1) this.options.onLeaseLost?.(message);
+      if (updated.length !== 1) this.observe(() => this.options.onLeaseLost?.(message));
       return updated.length === 1;
     } catch (error) {
       await finishHeartbeat();
       if (this.cancelling || !owned) {
-        if (!this.cancelling) this.options.onLeaseLost?.(message);
+        if (!this.cancelling) this.observe(() => this.options.onLeaseLost?.(message));
         return false;
       }
       const retry = OutboxMessage.rehydrate({
@@ -248,12 +248,16 @@ export class OutboxPublisher {
         where id = ? and lease_token = ? and published_at is null
         returning id
       `, [retry.nextAttemptAt!, message.id, row.lease_token]);
-      if (updated.length === 1) this.options.onRetry?.(message, error);
-      else this.options.onLeaseLost?.(message);
+      if (updated.length === 1) this.observe(() => this.options.onRetry?.(message, error));
+      else this.observe(() => this.options.onLeaseLost?.(message));
       return false;
     } finally {
       await finishHeartbeat();
       this.deliveries.delete(delivery);
     }
+  }
+
+  private observe(callback: () => void): void {
+    try { callback(); } catch { /* Diagnostic callbacks cannot change durable delivery state. */ }
   }
 }

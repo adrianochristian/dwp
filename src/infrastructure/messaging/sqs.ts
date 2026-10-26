@@ -28,6 +28,22 @@ export class SqsCallTimeoutError extends Error {
   }
 }
 
+/** Classifies transport diagnostics without exposing an exception's raw text. */
+export function sqsDiagnosticCode(error: unknown, fallback = 'INFRASTRUCTURE_UNAVAILABLE'): string {
+  try {
+    if (error === null || typeof error !== 'object') return fallback;
+    const value = error as { code?: unknown; name?: unknown; $metadata?: unknown };
+    if (value.code === 'SQS_CALL_TIMEOUT' || value.name === 'SqsCallTimeoutError'
+      || (value.name === 'TimeoutError' && (value.code === 'ETIMEDOUT' || value.$metadata !== undefined))) {
+      return 'SQS_CALL_TIMEOUT';
+    }
+    if (value.code === 'OPERATION_CANCELLED' || value.code === 'ABORT_ERR' || value.name === 'AbortError') {
+      return 'OPERATION_CANCELLED';
+    }
+  } catch { /* Diagnostic inspection must not change recovery behavior. */ }
+  return fallback;
+}
+
 /** Bounds the entire SDK call, including its retries and backoff. */
 export async function sqsCall<T>(operation: (signal: AbortSignal) => Promise<T>, options: SqsCallOptions = {}): Promise<T> {
   const timeoutMs = options.timeoutMs ?? 30_000;

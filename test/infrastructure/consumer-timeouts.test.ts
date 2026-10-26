@@ -98,7 +98,7 @@ integration('consumer transport deadlines and cancellation', () => {
     await Bun.sleep(1_100);
     expect(await context.receive()).toHaveLength(0);
     expect(await running).toBe(1);
-    expect(retries).toEqual(['SQS_CALL_TIMEOUT']);
+    expect(retries).toEqual(['ACK_FAILED']);
     expect(await context.query('select status, failure_code from dwp.wager_transactions where idempotency_key = ?',
       [envelope.data.idempotencyKey])).toEqual([{ status: 'PROCESSED', failure_code: null }]);
     blockAck = false;

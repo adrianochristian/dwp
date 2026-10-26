@@ -44,7 +44,9 @@ if (import.meta.main) {
   const client = createSqsClient();
   try {
     await bootstrapQueues(client);
-    console.log(JSON.stringify({ event: 'queues_ready', queues: Object.values(queueNames) }));
+    try {
+      console.log(JSON.stringify({ event: 'queues_ready', queues: Object.values(queueNames) }));
+    } catch { /* Queue creation already succeeded; its diagnostic is best-effort. */ }
   } finally {
     client.destroy();
   }

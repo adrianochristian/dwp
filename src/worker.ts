@@ -1,13 +1,13 @@
 import { createWageringService } from './infrastructure/persistence/wagering-services.js';
-import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher.js';
-import { createSqsClient, getQueueUrl, queueNames } from './infrastructure/messaging/sqs.js';
+import { OutboxPublisher, type OutboxDelivery } from './infrastructure/messaging/outbox-publisher.js';
+import { createSqsClient, getQueueUrl, queueNames, sqsDiagnosticCode } from './infrastructure/messaging/sqs.js';
 import { createDatabase } from './infrastructure/persistence/database.js';
-import { SqsConsumer } from './infrastructure/messaging/sqs-consumer.js';
+import { SqsConsumer, type SqsConsumerObservation } from './infrastructure/messaging/sqs-consumer.js';
 import { ReferenceWorker } from './application/reference-worker.js';
 import { ObservedWageringService } from './observability/observed-wagering.js';
 import { createOperationalApplication } from './observability/operational-server.js';
 import { metrics } from './observability/metrics.js';
-import { log } from './observability/logger.js';
+import { log, type LogContext } from './observability/logger.js';
 import type { INestApplication } from '@nestjs/common';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { publisherConfiguration, runPublisherLoop } from './infrastructure/messaging/publisher-loop.js';
@@ -16,6 +16,44 @@ export interface WorkerShutdownOptions {
   drainMs?: number;
   cleanupMs?: number;
   deadlineMs?: number;
+}
+
+function eventIdentifiers(message: OutboxDelivery): LogContext {
+  const context: LogContext = { messageId: message.id, correlationId: message.id };
+  try {
+    const correlation = message.payload.correlationId;
+    if (typeof correlation === 'string' && correlation.length <= 200 && !/[\u0000-\u001f\uD800-\uDFFF]/u.test(correlation)) {
+      context.correlationId = correlation;
+    }
+    const data = message.payload.data;
+    if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+      const record = data as Record<string, unknown>;
+      for (const key of ['transactionId', 'walletId', 'providerId'] as const) {
+        const value = record[key];
+        if (typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f\uD800-\uDFFF]/u.test(value)) {
+          context[key] = value;
+        }
+      }
+    }
+  } catch { /* Only validated identifiers are useful to diagnostics. */ }
+  return context;
+}
+
+function consumerIdentifiers(observation?: SqsConsumerObservation): LogContext {
+  return {
+    correlationId: observation?.correlationId,
+    messageId: observation?.messageId,
+    transactionId: observation?.transactionId,
+    walletId: observation?.walletId,
+    providerId: observation?.providerId,
+  };
+}
+
+function transportDiagnostic(observation: SqsConsumerObservation): void {
+  if (observation.causeCode && observation.causeCode !== observation.failureCode) {
+    log('command_transport_failed', { ...consumerIdentifiers(observation),
+      code: observation.causeCode, status: observation.status, attempt: observation.attempt });
+  }
 }
 
 export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<void> {
@@ -77,21 +115,22 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
         process.env.EVENT_QUEUE_URL ?? await getQueueUrl(sqs, queueNames.events, startup.signal), {
           batchSize: publisherOptions.batchSize,
           leaseMs: publisherOptions.leaseMs,
-          onRetry: message => {
+          onRetry: (message, error) => {
             metrics.increment('retries', { role: 'publisher' });
-            log('outbox_retry', { messageId: message.id, correlationId: message.id, attempt: message.attempts, code: 'SQS_PUBLISH_FAILED' });
+            log('outbox_retry', { ...eventIdentifiers(message), attempt: message.attempts,
+              code: sqsDiagnosticCode(error, 'SQS_PUBLISH_FAILED') });
           },
           onLeaseLost: message => {
             metrics.increment('outbox_lease_losses', { role: 'publisher' });
-            log('outbox_lease_lost', { messageId: message.id, code: 'OUTBOX_LEASE_LOST' });
+            log('outbox_lease_lost', { ...eventIdentifiers(message), code: 'OUTBOX_LEASE_LOST' });
           },
         });
       loops.push(runPublisherLoop(publisher, publisherOptions, {
         signal: publisherLoop.signal,
         onPublished: count => metrics.increment('outbox_published', { role: 'publisher' }, count),
-        onError: () => {
+        onError: error => {
           metrics.increment('outbox_failures', { role: 'publisher' });
-          log('publisher_cycle_failed', { code: 'INFRASTRUCTURE_UNAVAILABLE' });
+          log('publisher_cycle_failed', { code: sqsDiagnosticCode(error) });
         },
       }));
     }
@@ -101,25 +140,27 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
         process.env.DLQ_QUEUE_URL ?? getQueueUrl(sqs, queueNames.deadLetters, startup.signal),
       ]);
       consumer = new SqsConsumer(new ObservedWageringService(createWageringService(database), 'sqs'), sqs, commands, deadLetters, {
-        onError: () => log('consumer_cycle_failed', { code: 'INFRASTRUCTURE_UNAVAILABLE' }),
+        onError: (error, observation) => log('consumer_cycle_failed', { ...consumerIdentifiers(observation), code: sqsDiagnosticCode(error) }),
         onRetry: observation => {
           metrics.increment('retries', { role: 'consumer' });
-          log('command_retry', { messageId: observation.messageId, transactionId: observation.transactionId,
+          log('command_retry', { ...consumerIdentifiers(observation),
             code: observation.failureCode, attempt: observation.attempt });
+          transportDiagnostic(observation);
         },
         onDeadLetter: observation => {
           metrics.increment('dlq', { role: 'consumer' });
-          log('command_dead_lettered', { messageId: observation.messageId, transactionId: observation.transactionId,
+          log('command_dead_lettered', { ...consumerIdentifiers(observation),
             code: observation.failureCode, status: observation.status, attempt: observation.attempt });
+          transportDiagnostic(observation);
         },
       });
       loops.push(consumer.run());
     }
     if (role === 'reference' || role === 'all') {
       references = new ReferenceWorker(database, new ObservedWageringService(createWageringService(database), 'reference'), {
-        onRetry: id => {
+        onRetry: (id, error) => {
           metrics.increment('retries', { role: 'reference' });
-          log('reference_retry_failed', { transactionId: id, correlationId: id, code: 'INFRASTRUCTURE_UNAVAILABLE' });
+          log('reference_retry_failed', { transactionId: id, correlationId: id, code: sqsDiagnosticCode(error) });
         },
         onResult: (id, result) => {
           if (result && typeof result === 'object' && 'status' in result && result.status === 'PENDING_REFERENCE') {
@@ -138,8 +179,11 @@ export async function runWorker(shutdown: WorkerShutdownOptions = {}): Promise<v
         }
       })());
     }
-    console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid, metricsAddress: await operational.getUrl(),
-      ...(publisher ? { publisherConfiguration: publisherOptions } : {}) }));
+    const metricsAddress = await operational.getUrl();
+    try {
+      console.log(JSON.stringify({ event: 'worker_started', role, pid: process.pid, metricsAddress,
+        ...(publisher ? { publisherConfiguration: publisherOptions } : {}) }));
+    } catch { /* An unavailable startup diagnostic sink must not stop the worker. */ }
     await Promise.race([Promise.all(loops), stopped]);
   } catch (error) {
     if (!stopping) throw error;

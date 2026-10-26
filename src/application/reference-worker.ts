@@ -65,15 +65,19 @@ export class ReferenceWorker {
       try {
         const result = await this.handler.reprocess(id);
         if (result === undefined) return false;
-        this.options.onResult?.(id, result);
+        this.observe(() => this.options.onResult?.(id, result));
         return true;
       } catch (error) {
-        this.options.onRetry?.(id, error);
+        this.observe(() => this.options.onRetry?.(id, error));
         return false;
       }
     }));
     const failure = results.find(result => result.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
     return results.filter(result => result.status === 'fulfilled' && result.value).length;
+  }
+
+  private observe(callback: () => void): void {
+    try { callback(); } catch { /* Reprocessing already has its own durable result. */ }
   }
 }
