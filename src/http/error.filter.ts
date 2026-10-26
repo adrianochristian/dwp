@@ -77,6 +77,9 @@ function isInfrastructureFailure(chain: Record<string, unknown>[]): boolean {
   return chain.some(fields => {
     if (typeof fields.code === 'string'
       && (infrastructureCodes.has(fields.code) || /^(08|53)[A-Z0-9]{3}$/.test(fields.code))) return true;
+    // PostgreSQL refuses startup when a database temporarily disallows
+    // connections. Other 55000 prerequisite errors can be programming faults.
+    if (fields.code === '55000' && fields.severity === 'FATAL') return true;
     return fields.name === 'KnexTimeoutError';
   });
 }

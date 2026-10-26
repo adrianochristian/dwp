@@ -30,6 +30,14 @@ class ErrorProbeController {
       case 'serialization': throw Object.assign(new Error('private SQL text'), { code: '40001' });
       case 'connection': throw Object.assign(new Error('private network details'), { code: 'ECONNREFUSED' });
       case 'sqs-timeout': throw Object.assign(new Error('private queue details'), { code: 'SQS_CALL_TIMEOUT' });
+      case 'database-startup': throw new Error('private outer details', { cause: Object.assign(new Error('private database details'), {
+        code: '55000', severity: 'FATAL', routine: 'CheckMyDatabase',
+      }) });
+      case 'database-startup-legacy': throw Object.assign(new Error('private database details'), {
+        code: '55000', severity: 'FATAL', routine: 'InitPostgres',
+      });
+      case 'sql-prerequisite': throw Object.assign(new Error('private SQL text'), { code: '55000', severity: 'ERROR', routine: 'CheckMyDatabase' });
+      case 'sql-prerequisite-unknown': throw Object.assign(new Error('private SQL text'), { code: '55000', severity: 'FATAL', routine: 'UnknownOperation' });
       case 'sql-syntax': throw Object.assign(new Error('private SQL text'), { code: '42601' });
       default: throw new TypeError('private programming details');
     }
@@ -108,6 +116,9 @@ describe('HTTP error boundary', () => {
       ['serialization', 503, 'INFRASTRUCTURE_UNAVAILABLE'],
       ['connection', 503, 'INFRASTRUCTURE_UNAVAILABLE'],
       ['sqs-timeout', 503, 'INFRASTRUCTURE_UNAVAILABLE'],
+      ['database-startup', 503, 'INFRASTRUCTURE_UNAVAILABLE'],
+      ['database-startup-legacy', 503, 'INFRASTRUCTURE_UNAVAILABLE'],
+      ['sql-prerequisite-unknown', 503, 'INFRASTRUCTURE_UNAVAILABLE'],
     ] as const) {
       const response = await fetch(`${address}/probe/failure/${kind}`);
       expect(response.status).toBe(status);
@@ -118,7 +129,7 @@ describe('HTTP error boundary', () => {
   });
 
   test('returns internal errors for programming, invariant and SQL syntax failures', async () => {
-    for (const kind of ['unknown', 'invariant', 'sql-syntax']) {
+    for (const kind of ['unknown', 'invariant', 'sql-syntax', 'sql-prerequisite']) {
       const response = await fetch(`${address}/probe/failure/${kind}`);
       expect(response.status).toBe(500);
       expect(await response.json()).toEqual({ code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' });
