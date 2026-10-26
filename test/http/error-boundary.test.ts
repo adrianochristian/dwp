@@ -100,7 +100,9 @@ describe('HTTP error boundary', () => {
     ] as const) {
       const response = await fetch(`${address}/probe/application/${kind}`);
       expect(response.status).toBe(status);
-      expect(await response.json()).toEqual({ code: 'EXPLICIT_APPLICATION_CODE', message: 'A safe application message' });
+      expect(await response.json()).toEqual(kind === 'internal'
+        ? { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' }
+        : { code: 'EXPLICIT_APPLICATION_CODE', message: 'A safe application message' });
     }
     const cause = new Error('original cause');
     expect(new ApplicationError('unavailable', 'EXPLICIT_APPLICATION_CODE', 'safe', cause).cause).toBe(cause);

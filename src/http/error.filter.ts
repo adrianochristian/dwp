@@ -80,6 +80,10 @@ export class ApiErrorFilter implements ExceptionFilter {
       return;
     }
     if (exception instanceof ApplicationError) {
+      if (exception.kind === 'internal') {
+        response.status(500).json({ code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' });
+        return;
+      }
       response.status(applicationStatus[exception.kind]).json({ code: exception.code, message: exception.message });
       return;
     }
